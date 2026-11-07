@@ -279,6 +279,18 @@ class Rules(unittest.TestCase):
         q["TSLA"]["price"] = 370.04
         self.assertEqual([r["id"] for r in self.at("2026-10-19 12:00", rules, st, q)[0]], ["tsla-plan-target"])
 
+    def test_a_crypto_plan_gives_stop_and_target_but_no_flat_by_close(self):
+        plan = {"created_by": "trader-exit", "symbol": "COGE", "asset": "crypto", "side": "buy",
+                "date": "2026-11-07", "setup": "crypto-breakout", "entry": 0.0183,
+                "stop": 0.017902791, "stop_label": "2 x ATR(14) under the entry",
+                "target": 0.019094418, "target_label": "2R (two times the risk)",
+                "risk_per_share": 0.000397209, "reward_risk": 2.0, "flat_by": None}
+        rules = alerts.rules_from_plan(plan)
+        self.assertEqual([(r["id"], r["type"]) for r in rules],
+                         [("coge-plan-stop", "stop"), ("coge-plan-target", "target")])
+        self.assertEqual((rules[0]["price"], rules[1]["price"]), (0.017902791, 0.019094418))
+        self.assertTrue(all(r["date"] == "2026-11-07" for r in rules))
+
     def test_flat_by_close_rings_once_per_trading_day(self):
         rules = plan_rules()[2:]
         self.assertEqual(self.at("2026-10-19 15:54", rules)[0], [])
@@ -448,6 +460,103 @@ class Cli(unittest.TestCase):
         code, _, err = run(["check", "--rules", self.rules, "--offline", QDIR])
         self.assertEqual(code, 1)
         self.assertIn("no rules", err)
+
+
+MOON_PAIR = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
+
+
+class CryptoQuote(unittest.TestCase):
+    def test_crypto_quote_offline_json(self):
+        code, text, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                               "--pair", MOON_PAIR, "--offline", QDIR, "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["errors"], [])
+        q = doc["quotes"]["MOON"]
+        self.assertEqual(q["price_usd"], 0.017)
+        self.assertEqual(q["price"], 0.017)
+        self.assertEqual(q["price_change_24h_pct"], 12.5)
+        self.assertEqual(q["source"], "dexscreener")
+        self.assertEqual(q["chain"], "solana")
+        self.assertEqual(q["pair_address"], MOON_PAIR)
+
+    def test_crypto_quote_offline_text(self):
+        code, text, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                               "--pair", MOON_PAIR, "--offline", QDIR])
+        self.assertEqual(code, 0, err)
+        self.assertIn("MOON", text)
+        self.assertIn("0.017", text)
+        self.assertIn("dexscreener", text)
+
+    def test_crypto_quote_needs_a_pair(self):
+        code, _, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                            "--offline", QDIR, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("--pair", err)
+
+    def test_crypto_quote_unknown_chain_fails(self):
+        code, _, err = run(["quote", "--asset", "crypto", "--chain", "nosuchchain",
+                            "--pair", MOON_PAIR, "--offline", QDIR, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("nosuchchain", err)
+
+    def test_crypto_quote_unknown_pair_fails(self):
+        code, _, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                            "--pair", "NOPAIR", "--offline", QDIR, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("NOPAIR", err)
+
+    def test_crypto_quote_bad_offline_json_names_the_file(self):
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, "dexscreener-pairs.json"), "w") as fh:
+                fh.write("{not json")
+            code, _, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                                "--pair", MOON_PAIR, "--offline", d, "--json"])
+            self.assertEqual(code, 1)
+            self.assertIn("dexscreener-pairs.json", err)
+            self.assertIn("not valid JSON", err)
+        finally:
+            shutil.rmtree(d)
+
+    def test_crypto_quote_unreadable_offline_file_is_an_alert_error(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(d, "dexscreener-pairs.json"))   # a directory, not a file
+            code, _, err = run(["quote", "--asset", "crypto", "--chain", "solana",
+                                "--pair", MOON_PAIR, "--offline", d, "--json"])
+            self.assertEqual(code, 1)
+            self.assertIn("could not read", err)
+        finally:
+            shutil.rmtree(d)
+
+    def test_from_plan_reads_the_crypto_plan_by_default(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            os.mkdir("trader")
+            plan = {"created_by": "trader-exit", "symbol": "COGE", "asset": "crypto", "side": "buy",
+                    "date": "2026-11-07", "setup": "crypto-breakout", "entry": 0.0183,
+                    "stop": 0.017902791, "stop_label": "2 x ATR(14) under the entry",
+                    "target": 0.019094418, "target_label": "2R (two times the risk)",
+                    "risk_per_share": 0.000397209, "reward_risk": 2.0, "flat_by": None}
+            with open(os.path.join("trader", "plan-crypto.json"), "w") as fh:
+                json.dump(plan, fh)
+            rules = os.path.join(d, "alerts.json")
+            state = os.path.join(d, "state.json")
+            code, text, err = run(["add", "--from-plan", "--asset", "crypto",
+                                   "--rules", rules, "--state", state])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Added coge-plan-stop", text)
+            self.assertIn("Added coge-plan-target", text)
+            self.assertNotIn("flat-by", text)
+            with open(rules) as fh:
+                ids = [r["id"] for r in json.load(fh)["rules"]]
+            self.assertEqual(ids, ["coge-plan-stop", "coge-plan-target"])
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(d)
 
 
 if __name__ == "__main__":

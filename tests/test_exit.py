@@ -14,8 +14,11 @@ from _load import load, FIX, ROOT
 
 exitp = load("trader-exit", "exit")
 entry = load("trader-entry", "entry")
+crypto = load("trader-scanner", "crypto")
 
 TSLA = os.path.join(FIX, "trader-entry", "TSLA-2026-10-19-5m.json")
+XFIX = os.path.join(FIX, "trader-exit", "crypto-ohlcv.json")
+POOL = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
 
 # trader/plan.json for the reel, exactly as the contract writes it
 REEL_PLAN = {"created_by": "trader-exit", "symbol": "TSLA", "side": "buy", "date": "2026-10-19", "setup": "orb",
@@ -268,6 +271,139 @@ class Cli(unittest.TestCase):
         code, text, _ = run(exitp, ["show"])
         self.assertEqual(code, 1)
         self.assertIn("No plan", text)
+
+
+class CryptoExit(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.mkdir("trader")
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def plan(self, *args):
+        return run(exitp, ["plan", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                           "--entry", "0.0183", "--offline", XFIX, "--now", "2026-11-07 10:00Z"] + list(args))
+
+    def test_atr_stop_and_2r_target_at_8_significant_digits(self):
+        code, text, err = self.plan("--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual(p["asset"], "crypto")
+        self.assertEqual(p["symbol"], "COGE")
+        self.assertEqual(p["chain"], "solana")
+        self.assertEqual(p["pair"], POOL)
+        self.assertEqual(p["setup"], "crypto-breakout")
+        self.assertEqual((p["entry"], p["stop"], p["target"]), (0.0183, 0.017902791, 0.019094418))
+        self.assertEqual(p["risk_per_share"], 0.000397209)
+        self.assertEqual((p["stop_rule"], p["target_r"], p["reward_risk"]), ("atr", 2.0, 2.0))
+        self.assertEqual(p["atr_bars"], 14)
+        self.assertAlmostEqual(p["atr"], 0.0001986, places=7)
+        self.assertIsNone(p["flat_by"])
+        self.assertIn("no market close", p["flat_by_note"])
+        self.assertIn("no market close", p["warnings"][0])
+
+    def test_text_says_no_market_close(self):
+        code, text, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertIn("COGE long", text)
+        self.assertIn("Stop          $0.017902791", text)
+        self.assertIn("Target        $0.019094418", text)
+        self.assertIn("Flat by       none: no market close; exit on stop/target only", text)
+        self.assertIn("no market close", text)
+
+    def test_atr_mult_and_target_r_flags(self):
+        code, text, err = self.plan("--atr-mult", "1.0", "--target-r", "1.0", "--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["stop"], p["risk_per_share"], p["target"]), (0.018101395, 0.000198605, 0.018498605))
+        self.assertEqual(p["target_r"], 1.0)
+
+    def test_compute_keeps_8_decimals(self):
+        p = exitp.compute(0.0183, "atr", Decimal("2.0"), "r", Decimal("2.0"),
+                          atr=0.00019860428571428536, atr_bars=14, places=8)
+        self.assertEqual((p["stop"], p["risk"], p["target"]),
+                         (Decimal("0.0179028"), Decimal("0.0003972"), Decimal("0.0190944")))
+        self.assertEqual(p["stop_label"], "2 x ATR(14) under the entry")
+
+    def test_significant_digits_keep_a_tiny_price(self):
+        self.assertEqual(exitp.sig("0.0000001234"), Decimal("0.0000001234"))
+        self.assertEqual(exitp.sig("0.000000004"), Decimal("0.000000004"))
+        self.assertEqual(exitp.sig("1.234567895"), Decimal("1.2345679"))
+        self.assertEqual(exitp.floor_sig("1.234567895"), Decimal("1.2345678"))
+        p = exitp.compute(0.0000001234, "atr", Decimal("2.0"), "r", Decimal("2.0"),
+                          atr=0.00000002, atr_bars=14, sig_digits=8)
+        self.assertEqual((p["entry"], p["stop"], p["target"]),
+                         (Decimal("0.0000001234"), Decimal("0.0000000834"), Decimal("0.0000002034")))
+        p = exitp.compute(0.00000001, "atr", Decimal("2.0"), "r", Decimal("2.0"),
+                          atr=0.000000003, atr_bars=14, sig_digits=8)
+        self.assertEqual(p["stop"], Decimal("0.000000004"))  # 8 decimals would round this to $0
+
+    def test_crypto_write_defaults_to_plan_crypto_json(self):
+        code, text, err = self.plan("--write")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(os.path.join("trader", "plan.json")))
+        with open(os.path.join("trader", "plan-crypto.json")) as fh:
+            p = json.load(fh)
+        self.assertEqual(p["asset"], "crypto")
+        self.assertEqual(p["symbol"], "COGE")
+
+    def test_stock_write_still_defaults_to_plan_json(self):
+        with open(os.path.join("trader", "entry.json"), "w") as fh:
+            json.dump(REEL_ENTRY, fh)
+        code, text, err = run(exitp, ["plan", "--stop", "or-mid", "--target", "1R",
+                                      "--now", "2026-10-19 10:16", "--write"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(os.path.join("trader", "plan.json")))
+        self.assertFalse(os.path.exists(os.path.join("trader", "plan-crypto.json")))
+        with open(os.path.join("trader", "plan.json")) as fh:
+            self.assertEqual(json.load(fh)["symbol"], "TSLA")
+
+    def test_show_reads_the_crypto_plan(self):
+        code, _, err = self.plan("--write")
+        self.assertEqual(code, 0, err)
+        code, text, err = run(exitp, ["show", "--asset", "crypto"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("COGE long", text)
+        self.assertIn("Flat by       none", text)
+        code, text, err = run(exitp, ["show", "--plan", os.path.join("trader", "plan-crypto.json")])
+        self.assertEqual(code, 0, err)
+        self.assertIn("COGE long", text)
+
+    def test_nan_atr_mult_is_rejected(self):
+        code, _, err = self.plan("--atr-mult", "nan")
+        self.assertEqual(code, 1)
+        self.assertIn("--atr-mult", err)
+
+    def test_refusals(self):
+        cases = [
+            (["--entry", "0"], "above $0"),
+            (["--chain", "nosuch"], "unknown chain nosuch"),
+            (["--flat-by", "15:55"], "no market close"),
+            (["--stop", "pct:1"], "--atr-mult"),
+            (["--target", "1R"], "--target-r"),
+            (["--symbol", "COGE"], "--chain and --pair"),
+        ]
+        for extra, words in cases:
+            code, _, err = self.plan(*extra)
+            self.assertEqual(code, 1, extra)
+            self.assertIn(words, err, extra)
+        code, _, err = run(exitp, ["plan", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                                   "--offline", XFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("--entry", err)
+        code, _, err = run(exitp, ["plan", "--asset", "crypto", "--chain", "solana", "--entry", "0.0183",
+                                   "--offline", XFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("--pair", err)
+        code, _, err = run(exitp, ["plan", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                                   "--entry", "0.0183", "--offline",
+                                   os.path.join(FIX, "trader-entry", "missing.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("no offline file", err)
 
 
 class SkillDoc(unittest.TestCase):

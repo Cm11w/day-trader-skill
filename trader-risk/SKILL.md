@@ -147,6 +147,49 @@ reward:risk 0.44. At 9:40 they are blocked by the window (no new entries
 before 9:45). The 3:55 PM sell that closes the position passes, even though
 it is after the 3:30 entry cutoff: it is an exit.
 
+## Crypto meme check (`check.py crypto`)
+
+A meme pool is not a stock order, so it gets its own check, not the
+order rules above. It reads one DexScreener pool and, on EVM chains, its
+GoPlus security record, and reports PASS, FAIL or UNKNOWN per check.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/check.py" crypto --chain solana --pair ADDR
+python3 "${CLAUDE_SKILL_DIR}/check.py" crypto --chain base --pair ADDR --token 0x... --json
+python3 "${CLAUDE_SKILL_DIR}/check.py" crypto --chain solana --pair ADDR --offline DIR --json
+```
+
+`--offline DIR` reads `dexscreener-pairs.json` and `goplus.json` from DIR
+instead of the network. The pool is the `--pair` pool, or the most liquid
+pair for `--token` when no `--pair` matches. Exit 1 only when the verdict
+is fail; an unknown verdict still exits 0, because nothing failed.
+
+| check | passes when | unknown when |
+| --- | --- | --- |
+| liquidity | liquidity_usd at least 10000 | never |
+| volume24h | volume24h_usd at least 5000 | never |
+| market_cap | market_cap_usd over 0 | market cap unpublished (only the FDV is) |
+| top10 | top 10 holders own at most 50% | no holder data |
+| honeypot | is_honeypot is False | no security data |
+| buy_tax / sell_tax | each at most 5% | tax missing |
+| cannot_buy | cannot_buy is False | no security data |
+| is_proxy | always (a proxy is a warning, not a failure) | no security data |
+
+The verdict is fail when any check fails, unknown when nothing fails but
+something is UNKNOWN, else pass. A proxy contract passes with the detail
+"proxy contract: upgradeable".
+
+GoPlus covers EVM chains only (ethereum, bsc, polygon, arbitrum,
+optimism, avalanche, base). On solana and robinhood there is no GoPlus
+data, so every security check is UNKNOWN with the reason "GoPlus covers
+EVM chains only; Solana honeypot data needs GMGN (API key, out of
+scope)". If GoPlus does not answer at all (a rate limit, a server error),
+the security checks are UNKNOWN and the check still exits 0: a dead
+security source never fails the whole check. GMGN security data needs an
+API key and is out of scope. A pass here only means the pool cleared these
+floors; it is not a recommendation, and it says nothing about the team,
+the tokenomics or whether the pool will still be there tomorrow.
+
 ## Rules
 
 - A PASS only means the order is allowed to be shown to the user. It is not a yes.

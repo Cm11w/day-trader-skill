@@ -8,6 +8,8 @@ It never places an order.
     python3 exit.py plan --symbol TSLA --entry 364.18 --or-high 362.18 --or-low 354.47
     python3 exit.py plan --stop atr:1.5 --offline TSLA.json # ATR needs the session's bars
     python3 exit.py plan --symbol NVDA --entry 190.25 --setup level --stop pct:1
+    python3 exit.py plan --asset crypto --chain solana --pair ADDR --entry 0.0183
+    python3 exit.py plan --asset crypto --chain solana --pair ADDR --entry 0.0183 --offline ohlcv.json --json
     python3 exit.py show                                    # the current trader/plan.json
 
 Stops (a long's stop rounds DOWN to the cent, away from the entry):
@@ -42,13 +44,14 @@ import argparse
 import datetime
 import gzip
 import json
+import math
 import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP, localcontext
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/Jakeschincariol/day-trader-skill)"
 BACKOFF = 5.0
@@ -202,18 +205,45 @@ def D(x, what="a number"):
         raise PlanError("%s is not a number: %r" % (what, x))
 
 
-def cents(x):
-    """Round half up to the cent."""
-    return D(x).quantize(CENT, rounding=ROUND_HALF_UP)
+def _quantum(places):
+    return Decimal(1).scaleb(-places)
 
 
-def floor_cents(x):
+def cents(x, places=2):
+    """Round half up to the quantum: cents for stocks, 8 decimals for crypto."""
+    return D(x).quantize(_quantum(places), rounding=ROUND_HALF_UP)
+
+
+def sig(x, digits=8):
+    """Round to significant digits, not decimal places: $0.0000001234 keeps
+    8 significant digits ($0.0000001234), $0.000000004 stays $0.000000004
+    instead of rounding to $0.00000000. Stocks keep cents()."""
+    d = D(x)
+    if d == 0:
+        return Decimal(0)
+    with localcontext() as ctx:
+        ctx.prec = digits
+        return +d
+
+
+def floor_sig(x, digits=8):
+    """A long's stop, rounded down to significant digits (away from the entry)."""
+    d = D(x)
+    if d == 0:
+        return Decimal(0)
+    s = sig(d, digits)
+    if s > d:
+        s -= Decimal(1).scaleb(s.adjusted() - digits + 1)
+    return s
+
+
+def floor_cents(x, places=2):
     """A long's stop: round down, away from the entry."""
-    return D(x).quantize(CENT, rounding=ROUND_FLOOR)
+    return D(x).quantize(_quantum(places), rounding=ROUND_FLOOR)
 
 
-def money(x):
-    return "$%s" % format(D(x).quantize(CENT), ",f")
+def money(x, places=2):
+    return "$%s" % format(D(x).quantize(_quantum(places)), ",f")
 
 
 def num(x):
@@ -268,22 +298,30 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None):
-    """The stop, the target and the risk, in exact cents. Raises PlanError with the reason."""
-    e = cents(entry)
+            atr=None, atr_bars=None, places=2, sig_digits=None):
+    """The stop, the target and the risk, in exact cents. Raises PlanError with the reason.
+    sig_digits rounds to significant digits instead of decimal places: crypto
+    passes sig_digits=8, so a $0.0000001234 entry keeps 8 significant digits
+    and a $0.000000004 stop stays above $0 instead of rounding to $0.00000000.
+    Stocks pass places=2 and are untouched."""
+    def qp(x):
+        return sig(x, sig_digits) if sig_digits else cents(x, places)
+    def fp(x):
+        return floor_sig(x, sig_digits) if sig_digits else floor_cents(x, places)
+    e = qp(entry)
     if e <= 0:
         raise PlanError("the entry price must be above $0")
     detail = ""
     if stop_rule in ("or_mid", "or_low"):
         if or_high is None or or_low is None:
             raise PlanError("an %s stop needs the opening range (--or-high and --or-low)" % stop_rule.replace("_", "-"))
-        oh, ol = cents(or_high), cents(or_low)
+        oh, ol = qp(or_high), qp(or_low)
         if oh <= ol:
-            raise PlanError("the opening-range high %s must be above its low %s" % (money(oh), money(ol)))
+            raise PlanError("the opening-range high %s must be above its low %s" % (money(oh, places), money(ol, places)))
         if stop_rule == "or_mid":
             raw = (oh + ol) / 2
             label = "opening-range midpoint"
-            detail = "(%s + %s) / 2 = $%s" % (money(oh), money(ol), num(raw))
+            detail = "(%s + %s) / 2 = $%s" % (money(oh, places), money(ol, places), num(raw))
         else:
             raw, label = ol, "opening-range low"
     elif stop_rule == "price":
@@ -291,40 +329,47 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     elif stop_rule == "pct":
         raw = e * (1 - stop_param / 100)
         label = "%s%% under the entry" % num(stop_param)
-        detail = "%s x (1 - %s%%) = $%s" % (money(e), num(stop_param), num(raw))
+        detail = "%s x (1 - %s%%) = $%s" % (money(e, places), num(stop_param), num(raw))
     elif stop_rule == "atr":
         if atr is None:
             raise PlanError("an atr stop needs the session's bars")
-        a = D(round(atr, 6))
+        if sig_digits:
+            a = sig(atr, sig_digits)
+        else:
+            a = D(round(atr, max(6, places)))
         raw = e - stop_param * a
         label = "%s x ATR(%d) under the entry" % (num(stop_param), atr_bars)
+        if sig_digits:
+            aq = sig(a, sig_digits)
+        else:
+            aq = a.quantize(Decimal("0.0001")) if places <= 4 else a.quantize(_quantum(places))
         detail = "ATR $%s over the %d bars to the entry%s" % (
-            num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
+            num(aq), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
-    stop = floor_cents(raw)
+    stop = fp(raw)
     if stop != D(raw):
         detail = (detail + ", rounded down" if detail else "$%s rounded down" % num(raw))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
-                        % (money(stop), label, money(e)))
+                        % (money(stop, places), label, money(e, places)))
     if stop <= 0:
-        raise PlanError("the stop works out to %s: pick a stop above $0" % money(stop))
+        raise PlanError("the stop works out to %s: pick a stop above $0" % money(stop, places))
     risk = e - stop
     floor_risk = e * MIN_RISK_PCT / 100
     if risk < floor_risk:
         raise PlanError("the stop is %s under the entry, less than 0.05%% of the price (%s on %s): too tight to "
                         "survive the spread, normal wiggle would stop you out. Widen it."
-                        % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
+                        % ("$%s" % num(qp(risk)), "$%s" % num(qp(floor_risk)), "$%s" % num(qp(e))))
     if target_rule == "r":
-        target = cents(e + target_param * risk)
+        target = qp(e + target_param * risk)
         t_label = r_label(target_param)
     else:
-        target = cents(target_param)
+        target = qp(target_param)
         t_label = None
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
-                        % (money(target), money(e)))
+                        % (money(target, places), money(e, places)))
     rr = ((target - e) / risk).quantize(CENT, rounding=ROUND_HALF_UP)
     if t_label is None:
         t_label = "your price (%sR)" % ratio(rr)
@@ -562,7 +607,90 @@ def gather(a):
     return info
 
 
+def _crypto_module():
+    """The shared crypto data module, in trader-scanner next to this skill."""
+    here = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-scanner"))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import crypto
+    return crypto
+
+
+def _read_crypto_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError:
+        raise PlanError("no offline file %s" % path)
+    except ValueError as e:
+        raise PlanError("%s is not valid JSON: %s" % (path, e))
+
+
+def _crypto_symbol(doc, pair):
+    try:
+        sym = ((doc.get("meta") or {}).get("base") or {}).get("symbol") or ""
+    except AttributeError:
+        sym = ""
+    return sym.strip().upper() or pair
+
+
+def build_plan_crypto(a, now_utc):
+    """plan --asset crypto: an ATR stop and an R target for one pool, on UTC
+    time. Crypto trades 24/7, so there is no market close: flat_by is none
+    and the plan says to exit on stop/target only."""
+    crypto = _crypto_module()
+    if a.symbol or a.from_path:
+        raise PlanError("--asset crypto uses --chain and --pair, not --symbol or --from")
+    if a.entry is None:
+        raise PlanError("--asset crypto needs --entry PRICE")
+    if a.stop or a.target:
+        raise PlanError("--asset crypto uses --atr-mult and --target-r, not --stop or --target")
+    if a.flat_by:
+        raise PlanError("crypto has no market close: --flat-by does not apply (exit on stop/target only)")
+    if a.chain not in crypto.DEX_TO_GT:
+        raise PlanError("unknown chain %s: %s" % (a.chain, ", ".join(crypto.DEFAULT_CHAINS)))
+    if not a.pair:
+        raise PlanError("--asset crypto needs --pair POOL_ADDRESS (the GeckoTerminal pool address)")
+    for name, value in (("--atr-mult", a.atr_mult), ("--target-r", a.target_r)):
+        if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+            raise PlanError("%s must be a finite number" % name)
+    if a.atr_mult <= 0:
+        raise PlanError("--atr-mult must be above 0")
+    if a.target_r <= 0:
+        raise PlanError("--target-r must be above 0")
+    try:
+        if a.offline:
+            doc = _read_crypto_json(a.offline)
+        else:
+            doc = crypto.fetch_ohlcv(crypto.DEX_TO_GT[a.chain], a.pair, "minute", 5, 100)
+    except crypto.CryptoError as e:
+        raise PlanError(str(e))
+    bars = crypto.parse_ohlcv(doc)
+    now_ts = int((now_utc - EPOCH).total_seconds())
+    closed = [b for b in bars if b["t"] + 300 <= now_ts]
+    if len(closed) < 3:
+        raise PlanError("an atr stop needs at least 3 closed 5-minute bars for %s; found %d"
+                        % (a.pair, len(closed)))
+    atr, atr_n = atr_of(closed)
+    c = compute(a.entry, "atr", D(a.atr_mult), "r", D(a.target_r), atr=atr, atr_bars=atr_n,
+                places=8, sig_digits=8)
+    plan = {"created_by": "trader-exit", "symbol": _crypto_symbol(doc, a.pair), "asset": "crypto",
+            "chain": a.chain, "pair": a.pair, "side": "buy", "date": now_utc.date().isoformat(),
+            "setup": "crypto-breakout", "entry": float(c["entry"]),
+            "entry_time": None, "entry_bar": None, "interval": "5m", "opening_range": None,
+            "stop": float(c["stop"]), "stop_rule": "atr", "stop_label": c["stop_label"],
+            "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
+            "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": None,
+            "flat_by_note": "no market close; exit on stop/target only",
+            "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE,
+            "atr": round(atr, 8), "atr_bars": atr_n}
+    warnings = ["Crypto trades 24/7: no market close; exit on stop/target only."]
+    return plan, warnings
+
+
 def build_plan(a, now_utc):
+    if getattr(a, "asset", "stocks") == "crypto":
+        return build_plan_crypto(a, now_utc)
     info = gather(a)
     cfg = read_config(a.config)
     stop_text = a.stop
@@ -627,6 +755,11 @@ def build_plan(a, now_utc):
 def describe(plan):
     day = datetime.date.fromisoformat(plan["date"])
     setup = {"orb": "opening-range breakout", "level": "close above a level"}.get(plan["setup"], plan["setup"])
+    crypto_asset = plan.get("asset") == "crypto"
+
+    def pf(x):
+        return "$%.8g" % float(x) if crypto_asset else money(x)
+
     e = D(plan["entry"])
     risk = D(plan["risk_per_share"])
     pct = (risk / e * 100).quantize(CENT, rounding=ROUND_HALF_UP)
@@ -635,15 +768,19 @@ def describe(plan):
         when = " at %s" % plan["entry_time"]
         if plan.get("entry_bar") is not None:
             when += " (bar %d)" % plan["entry_bar"]
-    out = ["Exit plan: %s long, %s, %s on %s bars" % (
-        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute")]
-    out.append("  Entry         %s%s" % (money(plan["entry"]), when))
-    out.append("  Stop          %s  %s%s" % (money(plan["stop"]), plan["stop_label"],
+    out = ["Exit plan: %s long, %s, %s on %s bars%s" % (
+        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute",
+        " (UTC, crypto trades 24/7)" if crypto_asset else "")]
+    out.append("  Entry         %s%s" % (pf(plan["entry"]), when))
+    out.append("  Stop          %s  %s%s" % (pf(plan["stop"]), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
-    out.append("  Target        %s  %s" % (money(plan["target"]), plan["target_label"]))
-    out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
+    out.append("  Target        %s  %s" % (pf(plan["target"]), plan["target_label"]))
+    out.append("  Risk a share  %s (%s%% of the entry)" % (pf(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
-    out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
+    if plan.get("flat_by") is None:
+        out.append("  Flat by       none: no market close; exit on stop/target only")
+    else:
+        out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
@@ -652,6 +789,9 @@ def describe(plan):
 def cmd_plan(a):
     now = parse_now(a.now)
     plan, warnings = build_plan(a, now)
+    if a.write == "DEFAULT":
+        a.write = ("trader/plan-crypto.json" if plan.get("asset") == "crypto"
+                   else "trader/plan.json")
     if a.write:
         d = os.path.dirname(a.write)
         if d:
@@ -668,16 +808,25 @@ def cmd_plan(a):
         print("Note: " + w)
     if a.write:
         print("Wrote %s." % a.write)
-    print("Next: /trader-timemachine replays it, then /trader-budget sizes it to your max loss. Nothing was placed.")
+    if plan.get("asset") == "crypto":
+        print("Next: timemachine.py run --asset crypto --chain %s --pair %s replays it. Nothing was placed."
+              % (plan["chain"], plan["pair"]))
+    else:
+        print("Next: /trader-timemachine replays it, then /trader-budget sizes it to your max loss. Nothing was placed.")
     return 0
 
 
 def cmd_show(a):
+    if a.plan is None:
+        a.plan = ("trader/plan-crypto.json" if a.asset == "crypto" else "trader/plan.json")
     if not os.path.exists(a.plan):
         print("No plan at %s yet. Make one: exit.py plan --write" % a.plan)
         return 1
     plan = read_json(a.plan, "plan")
-    for k in ("symbol", "date", "entry", "stop", "target", "risk_per_share", "reward_risk", "flat_by"):
+    required = ("symbol", "date", "entry", "stop", "target", "risk_per_share", "reward_risk")
+    if plan.get("asset") != "crypto":
+        required += ("flat_by",)   # a crypto plan has no market close, so flat_by is none
+    for k in required:
         if plan.get(k) is None:
             raise PlanError("%s is missing %r: make a new plan with exit.py plan --write" % (a.plan, k))
     if a.json:
@@ -709,15 +858,24 @@ def main(argv=None):
     p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto (a pool, --chain and --pair)")
+    p.add_argument("--chain", default="solana", help="crypto only: DexScreener chain id")
+    p.add_argument("--pair", help="crypto only: the pool address")
+    p.add_argument("--atr-mult", type=float, default=2.0, help="crypto only: stop distance in ATRs")
+    p.add_argument("--target-r", type=float, default=2.0, help="crypto only: target in multiples of the risk")
     p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55)")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
     p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
-    p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
-                   help="save the plan (default trader/plan.json)")
+    p.add_argument("--write", nargs="?", const="DEFAULT", metavar="PATH",
+                   help="save the plan (default trader/plan.json, trader/plan-crypto.json for --asset crypto)")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("show", help="print the current plan")
-    p.add_argument("--plan", default="trader/plan.json")
+    p.add_argument("--plan", default=None,
+                   help="the plan file (default trader/plan.json, trader/plan-crypto.json for --asset crypto)")
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)

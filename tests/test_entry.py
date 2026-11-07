@@ -23,10 +23,13 @@ from contextlib import redirect_stdout, redirect_stderr
 from _load import load, FIX, ROOT
 
 entry = load("trader-entry", "entry")
+crypto = load("trader-scanner", "crypto")
 
 EDIR = os.path.join(FIX, "trader-entry")
 TSLA = os.path.join(EDIR, "TSLA-2026-10-19-5m.json")
 DEMO = os.path.join(EDIR, "DEMO-1m-synthetic.json")
+CFIX = os.path.join(EDIR, "crypto-ohlcv.json")
+POOL = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
 OPEN_TS = 1792416600       # 2026-10-19 09:30 EDT
 DT = datetime.datetime
 
@@ -583,6 +586,222 @@ class Cli(unittest.TestCase):
         self.assertEqual(json.loads(text)[0]["result"]["status"], "waiting")
         code, _, err = run(["watchlist", "--watchlist", "missing.json"])
         self.assertIn("run /trader-scanner first", err)
+
+
+def crypto_series(path=CFIX):
+    with open(path) as fh:
+        doc = json.load(fh)
+    series = crypto.ohlcv_to_series(crypto.parse_ohlcv(doc))
+    series["meta"] = {"symbol": "COGE", "chain": "solana", "pair": POOL}
+    return series
+
+
+def crypto_at(text="2026-11-07 10:30", series=None):
+    return entry.evaluate_crypto(series if series is not None else crypto_series(),
+                                 crypto.parse_now_utc(text))
+
+
+class CryptoEntry(unittest.TestCase):
+    def test_trigger_above_the_24h_high(self):
+        r = crypto_at()
+        self.assertEqual(r["symbol"], "COGE")
+        self.assertEqual(r["setup"], "crypto-breakout")
+        self.assertEqual(r["status"], "triggered")
+        self.assertEqual(r["date"], "2026-11-07")
+        self.assertEqual(r["level"], 0.01703138)
+        self.assertEqual(r["bars_closed"], 30)
+        t = r["trigger"]
+        self.assertEqual((t["time"], t["bar_start"], t["bar_index"]), ("10:30 AM", "10:25", 29))
+        self.assertEqual(t["price"], 0.0183)
+        self.assertEqual(t["pct_over"], 7.45)
+        self.assertAlmostEqual(r["atr"], 0.0003218, places=7)
+        self.assertEqual(r["atr_bars"], 14)
+        self.assertAlmostEqual(r["stop"], 0.0176564, places=7)
+        self.assertAlmostEqual(r["target"], 0.0195872, places=7)
+        self.assertEqual(r["minutes_since"], 0)
+        self.assertIn("24h high", r["reason"])
+
+    def test_no_trigger_when_the_last_close_is_under_the_high(self):
+        s = crypto_series()
+        s["c"][-1] = 0.0170
+        s["h"][-1] = 0.0170
+        r = crypto_at(series=s)
+        self.assertEqual(r["status"], "waiting")
+        self.assertIsNone(r["trigger"])
+        self.assertIn("under the 24h high $0.01703138", r["reason"])
+        self.assertEqual(r["last"]["close"], 0.0170)
+
+    def test_a_close_exactly_at_the_high_is_not_a_trigger(self):
+        s = crypto_series()
+        s["c"][-1] = 0.01703138
+        r = crypto_at(series=s)
+        self.assertEqual(r["status"], "waiting")
+
+    def test_too_few_bars_is_no_data(self):
+        s = crypto_series()
+        for k in ("t", "o", "h", "l", "c", "v"):
+            s[k] = s[k][:2]
+        r = crypto_at(series=s)
+        self.assertEqual(r["status"], "no-data")
+        self.assertIn("at least 3", r["reason"])
+
+    def test_atr_matches_the_wilder_math(self):
+        bars = [{"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+                for b in crypto.parse_ohlcv(json.load(open(CFIX)))]
+        atr, n = entry.atr_crypto(bars)
+        self.assertEqual(n, 14)
+        self.assertAlmostEqual(atr, 0.0003218, places=7)
+
+    def test_cli_check_offline_json(self):
+        code, text, err = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                               "--offline", CFIX, "--now", "2026-11-07 10:30", "--json"])
+        self.assertEqual(code, 0, err)
+        r = json.loads(text)
+        self.assertEqual((r["status"], r["symbol"], r["setup"]), ("triggered", "COGE", "crypto-breakout"))
+        self.assertAlmostEqual(r["stop"], 0.0176564, places=7)
+        self.assertNotIn("_bars", r)
+
+    def test_cli_check_text_says_utc_and_the_stop(self):
+        code, text, _ = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                             "--offline", CFIX, "--now", "2026-11-07 10:30"])
+        self.assertEqual(code, 0)
+        self.assertIn("UTC", text)
+        self.assertIn("GeckoTerminal", text)
+        self.assertIn("TRIGGERED 10:30 AM at $0.0183", text)
+        self.assertIn("Stop $0.0176564", text)
+        self.assertIn("target $0.0195872", text)
+        self.assertNotIn("ET ", text)
+
+    def test_cli_check_write_is_the_crypto_contract_shape(self):
+        d = tempfile.mkdtemp()
+        try:
+            out = os.path.join(d, "e.json")
+            code, text, err = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                                   "--offline", CFIX, "--now", "2026-11-07 10:30", "--write", out])
+            self.assertEqual(code, 0, err)
+            with open(out) as fh:
+                e = json.load(fh)
+            self.assertEqual(e["symbol"], "COGE")
+            self.assertEqual(e["setup"], "crypto-breakout")
+            self.assertEqual(e["source"], "geckoterminal")
+            self.assertEqual(e["status"], "triggered")
+            self.assertEqual(e["price"], 0.0183)
+            self.assertAlmostEqual(e["stop"], 0.0176564, places=7)
+            self.assertAlmostEqual(e["target"], 0.0195872, places=7)
+        finally:
+            shutil.rmtree(d)
+
+    def test_cli_refusals(self):
+        code, _, err = run(["check", "--asset", "crypto", "--chain", "nosuch", "--pair", POOL,
+                            "--offline", CFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("unknown chain nosuch", err)
+        code, _, err = run(["check", "--asset", "crypto", "--chain", "solana", "--offline", CFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("--pair", err)
+        code, _, err = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                            "--offline", os.path.join(EDIR, "missing.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("no offline file", err)
+        code, text, err = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                            "--offline", CFIX, "--now", "2026-11-07 08:00"])
+        self.assertEqual(code, 1)   # only the 08:00 bar exists and it has not closed yet
+        self.assertIn("NO DATA", text)
+
+    def test_1m_level_is_the_24h_high_not_the_fetch_high(self):
+        # 25 hours of 1-minute bars: a spike 25h ago must not set the level.
+        base = 1793959200  # 2026-11-06 10:00 UTC; last bar ends 2026-11-07 11:01 UTC
+        n = 1501
+        t = [base + 60 * i for i in range(n)]
+        h = [0.015] * n
+        h[0] = 0.02  # older than 24h before the last bar's close
+        c = [0.015] * n
+        c[-1] = 0.016  # above the 24h high 0.015, under the stale 0.02
+        series = {"t": t, "o": c[:], "h": h, "l": [0.014] * n, "c": c,
+                  "v": [1.0] * n,
+                  "meta": {"symbol": "TEST", "chain": "solana", "pair": POOL, "interval": "1m"}}
+        now = crypto.parse_now_utc("2026-11-07 11:01")
+        r = entry.evaluate_crypto(series, now)
+        self.assertEqual(r["status"], "triggered")
+        self.assertAlmostEqual(r["level"], 0.015)
+
+    def test_cli_1m_fetches_24h_of_bars(self):
+        seen = {}
+        real = crypto
+
+        class Stub(object):
+            DEX_TO_GT = real.DEX_TO_GT
+            CryptoError = real.CryptoError
+            parse_now_utc = staticmethod(real.parse_now_utc)
+            now_utc = staticmethod(real.now_utc)
+            parse_ohlcv = staticmethod(real.parse_ohlcv)
+            ohlcv_to_series = staticmethod(real.ohlcv_to_series)
+
+            def fetch_ohlcv_paged(self, network, pair, timeframe, aggregate, limit, pause=0.3):
+                seen["limit"] = limit
+                seen["aggregate"] = aggregate
+                with open(CFIX) as fh:
+                    return json.load(fh)
+
+        orig = entry._crypto_module
+        entry._crypto_module = lambda: Stub()
+        try:
+            code, text, err = run(["check", "--asset", "crypto", "--chain", "solana",
+                                   "--pair", POOL, "--interval", "1m",
+                                   "--now", "2026-11-07 10:30", "--json"])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(seen["limit"], 1440)
+            self.assertEqual(seen["aggregate"], 1)
+            code, text, err = run(["check", "--asset", "crypto", "--chain", "solana",
+                                   "--pair", POOL, "--now", "2026-11-07 10:30", "--json"])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(seen["limit"], 288)
+            self.assertEqual(seen["aggregate"], 5)
+        finally:
+            entry._crypto_module = orig
+
+    def test_trigger_with_no_usable_stop_is_no_stop_not_triggered(self):
+        # Wide lows (not highs) make ATR(14) huge while the level stays put.
+        s = crypto_series()
+        for i in range(len(s["t"]) - 15, len(s["t"]) - 1):
+            s["l"][i] = 0.005
+        r = crypto_at(series=s)
+        self.assertEqual(r["status"], "no-stop")
+        self.assertIsNone(r["stop"])
+        self.assertIsNone(r["target"])
+        self.assertIsNotNone(r["trigger"])
+        self.assertIn("no usable stop", r["reason"])
+
+    def test_no_stop_text_never_says_triggered_or_get_in(self):
+        s = crypto_series()
+        for i in range(len(s["t"]) - 15, len(s["t"]) - 1):
+            s["l"][i] = 0.005
+        r = crypto_at(series=s)
+        text = "\n".join(entry.describe(r))
+        self.assertIn("NO STOP", text)
+        self.assertNotIn("TRIGGERED", text)
+        self.assertNotIn("get in", text)
+        self.assertIn("Nothing was placed.", text)
+
+    def test_all_zero_bars_are_no_data_not_a_crash(self):
+        s = crypto_series()
+        for k in ("o", "h", "l", "c"):
+            s[k] = [0.0] * len(s["t"])
+        r = crypto_at(series=s)
+        self.assertEqual(r["status"], "no-data")
+        self.assertIn("no usable", r["reason"])
+
+    def test_nan_or_infinite_atr_mult_is_rejected(self):
+        with self.assertRaises(entry.EntryError):
+            entry.evaluate_crypto(crypto_series(), crypto.parse_now_utc("2026-11-07 10:30"),
+                                  atr_mult=float("nan"))
+        with self.assertRaises(entry.EntryError):
+            entry.evaluate_crypto(crypto_series(), crypto.parse_now_utc("2026-11-07 10:30"),
+                                  target_r=float("inf"))
+        code, _, err = run(["check", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                            "--offline", CFIX, "--atr-mult", "nan"])
+        self.assertEqual(code, 1)
+        self.assertIn("--atr-mult", err)
 
 
 class SkillDoc(unittest.TestCase):

@@ -478,13 +478,419 @@ def _json_ready(items):
     return out
 
 
+# ---------------------------------------------------------------- crypto mode
+
+def default_state(asset):
+    """The state file for one asset: crypto never mixes with the stock state."""
+    if asset == "crypto":
+        return "trader/state/news-crypto.json"
+    return "trader/state/news.json"
+
+
+def _load_crypto_modules():
+    """The shared crypto data module (trader-scanner/crypto.py) and the
+    community check (community.py, next to this script), loaded lazily so
+    the stock commands never touch them."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    for folder in (here, os.path.join(root, "trader-scanner")):
+        if folder not in sys.path:
+            sys.path.insert(0, folder)
+    import crypto
+    import community
+    return crypto, community
+
+
+def _offline_json(offline, name):
+    """One JSON file from an offline folder, or None when it is absent.
+    A file that is there but not usable JSON is a NewsError, not a crash."""
+    if not offline:
+        return None
+    path = os.path.join(offline, name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise NewsError("%s is not usable: %s" % (path, exc))
+
+
+def _mentions_from_offline(args):
+    """mentions.json from an offline folder, validated: a list of mention
+    dicts, or a dict with a "mentions" list. Anything else is a NewsError
+    (a string or a dict of the wrong shape would crash the activity check)."""
+    doc = _offline_json(args.offline, "mentions.json")
+    if doc is None:
+        return []
+    if isinstance(doc, dict):
+        mentions = doc.get("mentions")
+    elif isinstance(doc, list):
+        mentions = doc
+    else:
+        raise NewsError("mentions.json must be a list of mentions or a {\"mentions\": [...]} object")
+    if not isinstance(mentions, list) or any(not isinstance(m, dict) for m in mentions):
+        raise NewsError("mentions.json must be a list of mentions or a {\"mentions\": [...]} object")
+    return mentions
+
+
+def _read_json_arg(path, what):
+    """A JSON file named on the command line, or a NewsError."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise NewsError("%s file %s is not usable: %s" % (what, path, exc))
+
+
+def _fmt_price(price):
+    if price is None:
+        return "unknown"
+    return "${:,.8g}".format(price)
+
+
+def _fmt_change(change):
+    if change is None:
+        return "n/a"
+    return "%+.2f%%" % change
+
+
+def render_community(community):
+    """The community section of the text report, or [] when there is none."""
+    if not community:
+        return []
+    official = community.get("official") or {}
+    presence = community.get("presence") or {}
+    activity = community.get("activity") or {}
+    authenticity = community.get("authenticity") or {}
+    out = [""]
+    if official.get("has_x"):
+        confirm = " (confirmed by DexScreener and CoinGecko)" if official.get("confirmed_by_both") else ""
+        out.append("Community: @%s%s" % (official.get("handle"), confirm))
+    else:
+        out.append("Community: no official X account found")
+    followers = presence.get("twitter_followers")
+    telegram = presence.get("telegram_users")
+    out.append("  X followers: %s  Telegram: %s  (%s)" % (
+        "{:,}".format(followers) if followers is not None else "unknown",
+        "{:,}".format(telegram) if telegram is not None else "unknown",
+        presence.get("status", "unknown")))
+    if activity.get("status") == "known":
+        engagement = activity.get("engagement_rate_pct")
+        out.append("  Activity (%d days): %d posts, %s/day, median likes %s, "
+                   "median reposts %s, engagement %s" % (
+                       activity.get("window_days", 7), activity.get("posts", 0),
+                       activity.get("posts_per_day"),
+                       activity.get("median_likes"),
+                       activity.get("median_reposts"),
+                       ("%s%%" % engagement) if engagement is not None else "unknown"))
+    else:
+        out.append("  Activity: unknown (no dated mentions to measure)")
+    out.append("  Verdict: %s" % authenticity.get("verdict", "unknown"))
+    for flag in authenticity.get("flags") or []:
+        out.append("  Flag: %s" % flag)
+    for note in authenticity.get("notes") or []:
+        out.append("  Note: %s" % note)
+    kols = community.get("kols") or []
+    if kols:
+        for k in kols:
+            extra = ""
+            if "alive" in k:
+                extra = ", %d alive / %d dead tokens (%s)" % (k.get("alive", 0),
+                                                              k.get("dead", 0), k.get("status"))
+            out.append("  KOL: @%s (%s followers, %d mentions%s)" % (
+                k.get("handle"), "{:,}".format(k.get("followers") or 0),
+                k.get("mentions", 0), extra))
+    else:
+        out.append("  KOLs: none found in the mentions")
+    for limit in community.get("limits") or []:
+        out.append("  Limit: %s" % limit)
+    return out
+
+
+def _community_for_pair(crypto, community, args, now, socials, cg_doc, notes):
+    """CoinGecko detail, trending, mentions and KOL history for one pair."""
+    chain = args.chain
+    if cg_doc:
+        cg = crypto.parse_coingecko_community(cg_doc)
+    else:
+        cg = {"twitter_handle": None, "twitter_followers": None, "telegram_users": None,
+              "reddit_subscribers": None, "facebook_likes": None}
+    trending_doc = None
+    if args.offline:
+        trending_doc = _offline_json(args.offline, "cg-trending.json")
+    else:
+        try:
+            trending_doc = crypto.fetch_coingecko_trending()
+        except crypto.CryptoError as exc:
+            notes.append("CoinGecko trending unavailable: %s" % exc)
+    trending = False
+    if trending_doc:
+        coins = crypto.parse_coingecko_trending(trending_doc)
+        if cg.get("coin_id"):
+            trending = any(c.get("id") == cg["coin_id"] for c in coins)
+        else:
+            # Never match by bare symbol: dozens of PEPE/DOGE clones share
+            # one. Without the CoinGecko coin id there is no safe match.
+            notes.append("CoinGecko coin id unknown: trending not checked "
+                         "(a bare symbol would collide with clones)")
+    mentions = []
+    if args.mentions:
+        try:
+            mentions = community.load_mentions(args.mentions)
+        except community.CommunityError as exc:
+            raise NewsError(str(exc))
+    elif args.offline:
+        mentions = _mentions_from_offline(args)
+    if not mentions and not args.mentions and not args.offline:
+        notes.append("no mentions file: activity UNKNOWN")
+    result = community.assess_community(socials, cg, mentions, now=now)
+    if args.kol_tokens:
+        kol_map = _read_json_arg(args.kol_tokens, "kol-tokens")
+        if not isinstance(kol_map, dict):
+            raise NewsError("kol-tokens file %s is not a {handle: [addresses]} object"
+                            % args.kol_tokens)
+        kols = result.get("kols") or []
+        for k in kols:
+            k["tokens_mentioned"] = list(kol_map.get(k.get("handle"), []) or [])
+        addresses = [a for k in kols for a in k.get("tokens_mentioned", [])]
+        token_status = {}
+        if addresses:
+            if args.offline:
+                token_status = _offline_json(args.offline, "token-status.json") or {}
+                if not isinstance(token_status, dict):
+                    raise NewsError("token-status.json must be a "
+                                    "{token address: {liquidity_usd, volume24h_usd}} object")
+            else:
+                try:
+                    pairs = crypto.parse_dexscreener_pairs(
+                        crypto.fetch_dexscreener_pairs([(chain, a) for a in addresses]))
+                    for p in pairs:
+                        token_status[p.get("token_address")] = {
+                            "liquidity_usd": p.get("liquidity_usd", 0.0),
+                            "volume24h_usd": p.get("volume24h_usd", 0.0)}
+                except crypto.CryptoError as exc:
+                    notes.append("KOL token lookup unavailable: %s" % exc)
+        result["kols"] = community.assess_kol_history(kols, token_status)
+    return result, trending
+
+
+def crypto_pair_main(args, now):
+    """news.py --asset crypto --pair <pool>: price, community, trending."""
+    crypto, community = _load_crypto_modules()
+    if args.chain not in crypto.DEFAULT_CHAINS:
+        print("news: unknown chain %s: %s" % (args.chain, ", ".join(crypto.DEFAULT_CHAINS)),
+              file=sys.stderr)
+        return 2
+    notes = ["no Yahoo ticker for this token", "SEC/8-K skipped: stock-only"]
+    try:
+        if args.offline:
+            doc = _offline_json(args.offline, "dexscreener-pairs.json")
+            if doc is None:
+                raise NewsError("offline: no file %s"
+                                % os.path.join(args.offline, "dexscreener-pairs.json"))
+        elif args.token:
+            doc = crypto.fetch_dexscreener_token(args.token)
+        else:
+            doc = crypto.fetch_json("%s/latest/dex/pairs/%s/%s"
+                                    % (crypto.DS_BASE, args.chain, args.pair))
+    except crypto.CryptoError as exc:
+        print("news: %s" % exc, file=sys.stderr)
+        return 1
+    except NewsError as exc:
+        print("news: %s" % exc, file=sys.stderr)
+        return 1
+    pools = crypto.parse_dexscreener_pairs(doc)
+    found = False
+    if args.pair:
+        hits = [p for p in pools if p.get("pair_address") == args.pair]
+        if not hits and args.pair.startswith("0x"):
+            # EVM addresses differ in case only; the pool is the same one
+            # (a base58 address is case-sensitive, so this stays hex-only)
+            hits = [p for p in pools
+                    if (p.get("pair_address") or "").lower() == args.pair.lower()]
+        if hits:
+            pools = hits
+            found = True
+    if not pools:
+        print("news: no DexScreener pairs found for this token", file=sys.stderr)
+        return 1
+    best = max(pools, key=lambda p: p.get("liquidity_usd", 0.0))
+    pair = best.get("pair_address") or args.pair
+    if args.pair and not found:
+        notes.append("WARNING: pair %s was not in the returned pairs: using the most liquid pair %s"
+                     % (args.pair, pair))
+    token = args.token or best.get("token_address")
+    socials = crypto.parse_dexscreener_socials(doc)
+    cg_doc = None
+    platform = crypto.CG_PLATFORMS.get(args.chain)
+    if platform is None:
+        notes.append("CoinGecko has no contract pages for chain %s" % args.chain)
+    elif args.offline:
+        cg_doc = _offline_json(args.offline, "coingecko-contract.json")
+        if cg_doc is None:
+            notes.append("CoinGecko: token not listed (community presence UNKNOWN)")
+    else:
+        try:
+            cg_doc = crypto.fetch_coingecko_contract(platform, token)
+        except crypto.CryptoError:
+            notes.append("CoinGecko: token not listed (community presence UNKNOWN)")
+    try:
+        comm, trending = _community_for_pair(crypto, community, args, now, socials,
+                                             cg_doc, notes)
+    except NewsError as exc:
+        print("news: %s" % exc, file=sys.stderr)
+        return 1
+    price = best.get("price_usd")
+    change = best.get("price_change_24h_pct")
+    moves = [{"symbol": best.get("symbol"), "price_usd": price,
+              "price_change_24h_pct": change}]
+    if args.json:
+        print(json.dumps({"asset": "crypto", "chain": args.chain, "pair": pair,
+                          "symbol": best.get("symbol"), "price_usd": price,
+                          "price_change_24h_pct": change, "moves": moves, "items": [],
+                          "trending": trending, "community": comm, "notes": notes}, indent=2))
+    else:
+        lines = ["%s %s %s (24h)  %s  pair %s" % (best.get("symbol"), _fmt_price(price),
+                                                  _fmt_change(change), args.chain, pair)]
+        if trending:
+            lines[0] += "  TRENDING on CoinGecko"
+        for n in notes:
+            if n.startswith("WARNING:"):
+                lines.append(n)
+        lines += render_community(comm)
+        for n in notes:
+            if not n.startswith("WARNING:"):
+                lines.append("note: %s" % n)
+        lines.append("Checked %s. Headlines are leads, not facts; open the story before acting. "
+                     "Not financial advice." % to_eastern(now).strftime("%Y-%m-%d %H:%M ET"))
+        sys.stdout.write("\n".join(lines) + "\n")
+    state_path = args.state or default_state("crypto")
+    if not args.dry_run:
+        state = load_json(state_path) or {}
+        remember([], state, now)
+        folder = os.path.dirname(state_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+    return 0
+
+
+def crypto_tickers_main(args, now, watch):
+    """news.py --asset crypto --tickers BTC-USD: the Yahoo feeds, no SEC,
+    and a community check only when --cg-id names a CoinGecko coin."""
+    crypto, community = _load_crypto_modules()
+    state_path = args.state or default_state("crypto")
+    state = load_json(state_path) or {}
+    errors = ["SEC/8-K skipped: stock-only"]
+    fetcher = Fetcher(None, offline=args.offline)
+    items = collect(fetcher, watch, state, sec=False, errors=errors)
+    items = dedupe(tag(items, watch))
+    shown = select(items, state, now, hours=args.hours, show_all=args.all)
+    moves = collect_moves(fetcher, watch, errors)
+    comm = None
+    trending = False
+    if args.cg_id:
+        cg_doc = None
+        if args.offline:
+            cg_doc = _offline_json(args.offline, "coingecko-contract.json")
+        else:
+            try:
+                cg_doc = crypto.fetch_json("%s/coins/%s" % (crypto.CG_BASE, args.cg_id))
+            except crypto.CryptoError as exc:
+                errors.append("CoinGecko coin %s unavailable: %s" % (args.cg_id, exc))
+        if cg_doc is not None:
+            cg = crypto.parse_coingecko_community(cg_doc)
+            trending_doc = None
+            if args.offline:
+                trending_doc = _offline_json(args.offline, "cg-trending.json")
+            else:
+                try:
+                    trending_doc = crypto.fetch_coingecko_trending()
+                except crypto.CryptoError:
+                    trending_doc = None
+            if trending_doc:
+                trending = any(c.get("id") == cg.get("coin_id")
+                               for c in crypto.parse_coingecko_trending(trending_doc))
+            mentions = []
+            if args.mentions:
+                try:
+                    mentions = community.load_mentions(args.mentions)
+                except community.CommunityError as exc:
+                    print("news: %s" % exc, file=sys.stderr)
+                    return 1
+            elif args.offline:
+                mentions = _mentions_from_offline(args)
+            socials = {}
+            if args.offline:
+                pairs_doc = _offline_json(args.offline, "dexscreener-pairs.json")
+                if pairs_doc is not None:
+                    socials = crypto.parse_dexscreener_socials(pairs_doc)
+                else:
+                    errors.append("no dexscreener-pairs.json offline: DexScreener socials unavailable")
+            else:
+                platform = crypto.CG_PLATFORMS.get(args.chain)
+                token = ((cg_doc.get("platforms") or {}).get(platform) or "") if platform else ""
+                if token:
+                    try:
+                        socials = crypto.parse_dexscreener_socials(
+                            crypto.fetch_dexscreener_token(token))
+                    except crypto.CryptoError as exc:
+                        errors.append("DexScreener socials unavailable: %s" % exc)
+                else:
+                    errors.append("no contract address for %s on CoinGecko: "
+                                  "DexScreener socials unavailable" % args.chain)
+            comm = community.assess_community(socials, cg, mentions, now=now)
+    else:
+        errors.append("community skipped: pass --cg-id to check a CoinGecko coin")
+    if args.json:
+        mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
+                   moving=abs(m["pct"]) >= args.move_pct) for m in moves]
+        first = moves[0] if moves else None
+        print(json.dumps({"asset": "crypto", "chain": args.chain, "pair": None,
+                          "symbol": sorted(watch)[0] if watch else None,
+                          "price_usd": first["price"] if first else None,
+                          "price_change_24h_pct": first["pct"] if first else None,
+                          "moves": mv, "items": _json_ready(shown),
+                          "trending": trending, "community": comm,
+                          "notes": errors}, indent=2))
+    else:
+        out = render_moves(moves, args.move_pct)
+        out += render_community(comm)
+        text = render(shown, errors, now, [], args.move_pct)
+        if out:
+            out.append("")
+        sys.stdout.write("\n".join(out) + text)
+    if not args.dry_run:
+        remember(items, state, now)
+        folder = os.path.dirname(state_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+    return 0 if any(i["new"] for i in shown) else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--tickers", nargs="*", help="default: watchlist + plan + portfolio")
     ap.add_argument("--portfolio", default="trader/portfolio.json")
     ap.add_argument("--watchlist", default="trader/watchlist.json")
     ap.add_argument("--plan", default="trader/plan.json")
-    ap.add_argument("--state", default="trader/state/news.json")
+    ap.add_argument("--state", default=None,
+                    help="default: trader/state/news.json (stocks) or trader/state/news-crypto.json (crypto)")
+    ap.add_argument("--asset", default="stocks", choices=("stocks", "crypto"),
+                    help="stocks (default) or crypto")
+    ap.add_argument("--chain", default="solana", help="crypto chain id (DexScreener id)")
+    ap.add_argument("--pair", help="crypto pool address (pair mode)")
+    ap.add_argument("--token", help="crypto token address (pair mode; also picks the token)")
+    ap.add_argument("--mentions", metavar="FILE", help="mentions JSON for the community check")
+    ap.add_argument("--kol-tokens", metavar="FILE",
+                    help='{"handle": ["token address", ...]} for KOL history')
+    ap.add_argument("--cg-id", help="CoinGecko coin id (community check in --tickers mode)")
     ap.add_argument("--hours", type=float, default=48, help="ignore items older than this")
     ap.add_argument("--all", action="store_true", help="show seen items too")
     ap.add_argument("--forms", default="8-K", help="SEC forms to watch, comma separated")
@@ -499,6 +905,20 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    now = parse_time(args.now) if args.now else _dt.datetime.now(_dt.timezone.utc)
+    if args.asset == "crypto":
+        try:
+            if args.pair or args.token:
+                return crypto_pair_main(args, now)
+            if args.tickers:
+                watch = {t.upper(): None for t in args.tickers}
+                return crypto_tickers_main(args, now, watch)
+        except NewsError as exc:
+            print("news: %s" % exc, file=sys.stderr)
+            return 1
+        print("news: crypto mode needs --pair (or --token) or --tickers", file=sys.stderr)
+        return 2
+
     if args.tickers:
         watch = {t.upper(): None for t in args.tickers}
         known = watch_from_files(args.portfolio, args.watchlist, args.plan)
@@ -510,7 +930,8 @@ def main(argv=None):
               "trader/watchlist.json).", file=sys.stderr)
         return 2
     now = parse_time(args.now) if args.now else _dt.datetime.now(_dt.timezone.utc)
-    state = load_json(args.state) or {}
+    state_path = args.state or default_state("stocks")
+    state = load_json(state_path) or {}
     errors = []
     ua = sec_user_agent(args.user_agent, args.config)
     sec = not args.no_sec
@@ -533,10 +954,10 @@ def main(argv=None):
         sys.stdout.write(render(shown, errors, now, moves, args.move_pct))
     if not args.dry_run:
         remember(items, state, now)
-        folder = os.path.dirname(args.state)
+        folder = os.path.dirname(state_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        with open(args.state, "w", encoding="utf-8") as fh:
+        with open(state_path, "w", encoding="utf-8") as fh:
             json.dump(state, fh, indent=2)
             fh.write("\n")
     return 0 if any(i["new"] for i in shown) else 1

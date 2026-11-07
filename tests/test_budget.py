@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -93,6 +94,21 @@ class TheReel(unittest.TestCase):
                          [("max loss", 8), ("position cap", 10), ("max order", 10), ("cash", 12)])
         self.assertEqual([l["name"] for l in s["limits"] if l["binds"]], ["max loss"])
         self.assertIsNone(s["refusal"])
+
+    def test_a_crypto_plan_is_refused_not_sized_to_the_cent(self):
+        d = tempfile.mkdtemp()
+        try:
+            crypto_plan = plan(asset="crypto", symbol="COGE", entry=0.0183, stop=0.017902791,
+                               target=0.019094418, risk_per_share=0.000397209, flat_by=None)
+            path = os.path.join(d, "plan-crypto.json")
+            with open(path, "w") as fh:
+                json.dump(crypto_plan, fh)
+            code, _, err = run(["--plan", path, "--config", CFG, "--now", NOW, "--json"])
+            self.assertEqual(code, 1)
+            self.assertIn("crypto plan", err)
+            self.assertIn("to the cent", err)
+        finally:
+            shutil.rmtree(d)
 
     def test_the_bracket_order(self):
         o = size.bracket_order(size.size_trade(plan(), cfg(), today=TODAY))

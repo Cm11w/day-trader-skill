@@ -2,6 +2,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -202,6 +203,241 @@ class Check(unittest.TestCase):
         news.remember([], state, now)
         self.assertNotIn("old", state["seen"])
         self.assertEqual(state["last_check"], now.isoformat())
+
+
+CRYPTO_NOW = "2026-11-07T12:00:00+00:00"
+CRYPTO_PAIR = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
+CG_FIX = os.path.join(FIX, "crypto", "coingecko")
+DS_FIX = os.path.join(FIX, "crypto", "dexscreener")
+
+
+class CryptoPairNews(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.offline = os.path.join(self.tmp.name, "offline")
+        os.makedirs(self.offline)
+        shutil.copy(os.path.join(DIR, "dexscreener-pairs.json"),
+                    os.path.join(self.offline, "dexscreener-pairs.json"))
+        shutil.copy(os.path.join(CG_FIX, "contract_coge.json"),
+                    os.path.join(self.offline, "coingecko-contract.json"))
+        shutil.copy(os.path.join(CG_FIX, "trending.json"),
+                    os.path.join(self.offline, "cg-trending.json"))
+        shutil.copy(os.path.join(DIR, "mentions.json"),
+                    os.path.join(self.offline, "mentions.json"))
+        self.state = os.path.join(self.tmp.name, "state", "news-crypto.json")
+        self.base = ["--asset", "crypto", "--chain", "solana", "--pair", CRYPTO_PAIR,
+                     "--offline", self.offline, "--state", self.state,
+                     "--now", CRYPTO_NOW, "--dry-run"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pair_mode_json_offline(self):
+        code, out, err = run(self.base + ["--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["asset"], "crypto")
+        self.assertEqual(data["chain"], "solana")
+        self.assertEqual(data["pair"], CRYPTO_PAIR)
+        self.assertEqual(data["symbol"], "COGE")
+        self.assertAlmostEqual(data["price_usd"], 0.017)
+        self.assertEqual(data["price_change_24h_pct"], 10.0)
+        self.assertFalse(data["trending"])  # the fixture trending list has no COGE
+        self.assertEqual(data["community"]["official"]["handle"], "cogecoin")
+        self.assertTrue(data["community"]["official"]["confirmed_by_both"])
+        self.assertEqual(data["community"]["presence"]["twitter_followers"], 12345)
+        self.assertEqual(data["community"]["activity"]["posts"], 6)
+        self.assertEqual(data["community"]["authenticity"]["verdict"], "solid")
+        self.assertEqual([k["handle"] for k in data["community"]["kols"]], ["cryptowhale"])
+        self.assertIn("no Yahoo ticker for this token", data["notes"])
+        self.assertIn("SEC/8-K skipped: stock-only", data["notes"])
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_pair_mode_text_render(self):
+        code, out, err = run(self.base)
+        self.assertEqual(code, 0, err)
+        self.assertIn("COGE $0.017", out)
+        self.assertIn("@cogecoin", out)
+        self.assertIn("12,345", out)
+        self.assertIn("Verdict: solid", out)
+        self.assertIn("cryptowhale", out)
+        self.assertIn("Not financial advice", out)
+        self.assertNotIn(chr(0x2014), out)
+
+    def test_trending_when_coin_is_in_the_list(self):
+        shutil.copy(os.path.join(DIR, "cg-trending-coge.json"),
+                    os.path.join(self.offline, "cg-trending.json"))
+        code, out, err = run(self.base + ["--json"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["trending"])
+
+    def test_unlisted_on_coingecko_is_unknown_not_an_error(self):
+        os.unlink(os.path.join(self.offline, "coingecko-contract.json"))
+        code, out, err = run(self.base + ["--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["community"]["presence"]["status"], "unknown")
+        self.assertFalse(data["community"]["official"]["confirmed_by_both"])
+        self.assertTrue(any("not listed" in n for n in data["notes"]))
+
+    def test_kol_tokens_checked_offline(self):
+        shutil.copy(os.path.join(DIR, "kol-tokens.json"),
+                    os.path.join(self.tmp.name, "kol-tokens.json"))
+        shutil.copy(os.path.join(DIR, "token-status.json"),
+                    os.path.join(self.offline, "token-status.json"))
+        code, out, err = run(self.base + ["--json", "--kol-tokens",
+                                          os.path.join(self.tmp.name, "kol-tokens.json")])
+        self.assertEqual(code, 0, err)
+        kols = json.loads(out)["community"]["kols"]
+        self.assertEqual(len(kols), 1)
+        self.assertEqual(kols[0]["alive"], 1)
+        self.assertEqual(kols[0]["dead"], 1)
+        self.assertEqual(kols[0]["status"], "partial")
+
+    def test_crypto_uses_its_own_state_file_by_default(self):
+        self.assertEqual(news.default_state("crypto"), "trader/state/news-crypto.json")
+        self.assertEqual(news.default_state("stocks"), "trader/state/news.json")
+        self.assertNotEqual(news.default_state("crypto"), news.default_state("stocks"))
+
+    def test_pair_mode_needs_a_pair_or_tickers(self):
+        code, _, err = run(["--asset", "crypto", "--chain", "solana", "--offline",
+                            self.offline, "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("pair", err)
+
+    def test_trending_never_matches_by_bare_symbol(self):
+        # No CoinGecko doc (so no coin id) and a trending list with a COGE
+        # symbol under a different coin id: a bare-symbol match would say
+        # trending, the id match must not.
+        os.unlink(os.path.join(self.offline, "coingecko-contract.json"))
+        with open(os.path.join(self.offline, "cg-trending.json"), "w") as fh:
+            json.dump({"coins": [{"item": {"id": "some-other-coge", "symbol": "COGE",
+                                           "name": "COGE Clone"}}]}, fh)
+        code, out, err = run(self.base + ["--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertFalse(data["trending"])
+        self.assertTrue(any("coin id unknown" in n for n in data["notes"]))
+
+    def test_unmatched_pair_is_a_loud_warning_not_a_quiet_note(self):
+        code, out, err = run(["--asset", "crypto", "--chain", "solana", "--pair", "NOPAIR",
+                              "--token", "8UQdy5sHMVWUWSHeA5B3ZuuAVNumjSLPXdf19MXcpump",
+                              "--offline", self.offline, "--state", self.state,
+                              "--now", CRYPTO_NOW, "--dry-run", "--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["pair"], CRYPTO_PAIR)   # the most liquid pair, substituted
+        self.assertTrue(any(n.startswith("WARNING: pair NOPAIR") for n in data["notes"]))
+        code, out, err = run(["--asset", "crypto", "--chain", "solana", "--pair", "NOPAIR",
+                              "--token", "8UQdy5sHMVWUWSHeA5B3ZuuAVNumjSLPXdf19MXcpump",
+                              "--offline", self.offline, "--state", self.state,
+                              "--now", CRYPTO_NOW, "--dry-run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("WARNING: pair NOPAIR", out.splitlines()[1])
+
+    def test_lowercase_evm_pair_matches_the_same_pool(self):
+        # Live: DexScreener returns a checksummed pair address while the
+        # caller passes lowercase. That is the same pool, not a substitution.
+        with tempfile.TemporaryDirectory() as d:
+            doc = {"pairs": [{"baseToken": {"address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                                            "name": "USD Coin", "symbol": "USDC"},
+                              "chainId": "base", "dexId": "uniswap-v3",
+                              "pairAddress": "0x000000000000000000000000000000000000BEEF",
+                              "priceUsd": "1.0", "marketCap": 1000000,
+                              "liquidity": {"usd": 50000.0}, "volume": {"h24": 10000.0}}]}
+            with open(os.path.join(d, "dexscreener-pairs.json"), "w") as fh:
+                json.dump(doc, fh)
+            code, out, err = run(["--asset", "crypto", "--chain", "base",
+                                  "--pair", "0x000000000000000000000000000000000000beef",
+                                  "--token", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                                  "--offline", d, "--state", self.state,
+                                  "--now", CRYPTO_NOW, "--dry-run", "--json"])
+            self.assertEqual(code, 0, err)
+            data = json.loads(out)
+            self.assertEqual(data["pair"], "0x000000000000000000000000000000000000BEEF")
+            self.assertFalse(any(n.startswith("WARNING:") for n in data["notes"]))
+
+    def test_malformed_mentions_fixture_fails_cleanly(self):
+        with open(os.path.join(self.offline, "mentions.json"), "w") as fh:
+            fh.write('"just a string"')
+        code, _, err = run(self.base + ["--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("mentions.json", err)
+
+    def test_list_token_status_fixture_fails_cleanly(self):
+        shutil.copy(os.path.join(DIR, "kol-tokens.json"),
+                    os.path.join(self.tmp.name, "kol-tokens.json"))
+        with open(os.path.join(self.offline, "token-status.json"), "w") as fh:
+            json.dump([{"liquidity_usd": 1}], fh)
+        code, _, err = run(self.base + ["--json", "--kol-tokens",
+                                        os.path.join(self.tmp.name, "kol-tokens.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("token-status.json", err)
+
+
+class CryptoTickerNews(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.offline = os.path.join(self.tmp.name, "offline")
+        os.makedirs(self.offline)
+        shutil.copy(os.path.join(DIR, "yahoo-BTC-USD.xml"),
+                    os.path.join(self.offline, "yahoo-BTC-USD.xml"))
+        shutil.copy(os.path.join(DIR, "chart-BTC-USD.json"),
+                    os.path.join(self.offline, "chart-BTC-USD.json"))
+        shutil.copy(os.path.join(CG_FIX, "contract_coge.json"),
+                    os.path.join(self.offline, "coingecko-contract.json"))
+        shutil.copy(os.path.join(DIR, "mentions.json"),
+                    os.path.join(self.offline, "mentions.json"))
+        self.state = os.path.join(self.tmp.name, "state", "news-crypto.json")
+        self.base = ["--asset", "crypto", "--tickers", "BTC-USD", "--offline", self.offline,
+                     "--state", self.state, "--now", CRYPTO_NOW, "--dry-run",
+                     "--portfolio", os.path.join(self.tmp.name, "none.json"),
+                     "--watchlist", os.path.join(self.tmp.name, "none.json"),
+                     "--plan", os.path.join(self.tmp.name, "none.json")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_yahoo_tickers_still_work_in_crypto_mode(self):
+        code, out, err = run(self.base + ["--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["asset"], "crypto")
+        self.assertEqual(len(data["items"]), 2)
+        self.assertEqual(data["items"][0]["ticker"], "BTC-USD")
+        self.assertEqual(data["moves"][0]["ticker"], "BTC-USD")
+        self.assertAlmostEqual(data["moves"][0]["price"], 76104.92)
+        self.assertIn("SEC/8-K skipped: stock-only", data["notes"])
+
+    def test_cg_id_adds_community_to_ticker_mode(self):
+        code, out, err = run(self.base + ["--json", "--cg-id", "coge-coin-2"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["community"]["official"]["handle"], "cogecoin")
+        self.assertEqual(data["community"]["activity"]["posts"], 6)
+
+    def test_ticker_mode_fetches_dexscreener_socials_too(self):
+        # The CoinGecko doc without a twitter handle: the handle must still
+        # come from DexScreener socials, not from thin air.
+        shutil.copy(os.path.join(DIR, "dexscreener-pairs.json"),
+                    os.path.join(self.offline, "dexscreener-pairs.json"))
+        with open(os.path.join(CG_FIX, "contract_coge.json")) as fh:
+            cg_doc = json.load(fh)
+        cg_doc["links"]["twitter_screen_name"] = None
+        with open(os.path.join(self.offline, "coingecko-contract.json"), "w") as fh:
+            json.dump(cg_doc, fh)
+        code, out, err = run(self.base + ["--json", "--cg-id", "coge-coin-2"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["community"]["official"]["handle"], "cogecoin")
+        self.assertFalse(data["community"]["official"]["confirmed_by_both"])
+        self.assertNotIn("DexScreener socials unavailable", " | ".join(data["notes"]))
+
+    def test_ticker_mode_says_when_socials_are_unavailable(self):
+        code, out, err = run(self.base + ["--json", "--cg-id", "coge-coin-2"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIn("DexScreener socials unavailable", " | ".join(data["notes"]))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -10,6 +11,7 @@ from _load import load, ROOT, FIX
 
 check = load("trader-risk", "check")
 ticket = load("trader-broker", "ticket")
+crypto = load("trader-scanner", "crypto")
 
 CFG_PATH = os.path.join(ROOT, "trader-budget", "config.example.json")
 TSLA_PATH = os.path.join(FIX, "trader-risk", "orders-tsla.json")
@@ -517,6 +519,346 @@ class Cli(unittest.TestCase):
         with redirect_stderr(err):
             self.assertEqual(check.main(["--orders", TSLA_PATH, "--today", "monday", "--no-write"]), 1)
         self.assertIn("--today wants", err.getvalue())
+
+
+RISK_FIX = os.path.join(FIX, "trader-risk")
+SOL_DIR = os.path.join(RISK_FIX, "crypto-solana")
+BASE_DIR = os.path.join(RISK_FIX, "crypto-base")
+MOON_PAIR = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
+USDC_ADDR = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_PAIR = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+EVM_REASON = "no GoPlus security record for this token"
+BONK_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+GP_DIR = os.path.join(FIX, "crypto", "goplus")
+
+
+def solana_security():
+    """The live BONK security record (GoPlus Solana + RugCheck + Jupiter),
+    merged the way the risk check does it."""
+    goplus = crypto.parse_goplus_solana(load_json(os.path.join(GP_DIR, "solana_bonk.json")),
+                                        BONK_MINT)
+    rugcheck = crypto.parse_rugcheck(load_json(os.path.join(GP_DIR, "rugcheck_bonk.json")))
+    jupiter = crypto.parse_jupiter_quote(load_json(os.path.join(GP_DIR, "jupiter_bonk.json")))
+    return crypto.merge_solana_security(goplus, rugcheck, jupiter)
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def moon_pool():
+    doc = load_json(os.path.join(SOL_DIR, "dexscreener-pairs.json"))
+    return crypto.parse_dexscreener_pairs(doc)[0]
+
+
+def usdc_security():
+    return crypto.parse_goplus_security(load_json(os.path.join(BASE_DIR, "goplus.json")), USDC_ADDR)
+
+
+def check_of(res, name):
+    for c in res["checks"]:
+        if c["name"] == name:
+            return c
+    raise AssertionError("no check named %s in %s" % (name, res["checks"]))
+
+
+def run_risk(argv):
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = check.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+class CryptoMemeCheck(unittest.TestCase):
+    def test_a_good_pool_with_clean_security_passes(self):
+        res = check.check_crypto_meme(moon_pool(), usdc_security())
+        self.assertEqual(res["verdict"], "pass")
+        self.assertEqual(res["unknowns"], [])
+        self.assertTrue(all(c["pass"] is True for c in res["checks"]), res["checks"])
+        self.assertEqual([c["name"] for c in res["checks"]],
+                         ["liquidity", "volume24h", "market_cap", "top10", "honeypot",
+                          "buy_tax", "sell_tax", "cannot_buy", "is_proxy"])
+
+    def test_low_liquidity_fails(self):
+        pool = dict(moon_pool(), liquidity_usd=9000.0)
+        res = check.check_crypto_meme(pool, usdc_security())
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "liquidity")["pass"], False)
+        self.assertIn("10000", check_of(res, "liquidity")["detail"])
+
+    def test_low_volume_and_zero_market_cap_fail(self):
+        res = check.check_crypto_meme(dict(moon_pool(), volume24h_usd=100.0), usdc_security())
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "volume24h")["pass"], False)
+        res = check.check_crypto_meme(dict(moon_pool(), market_cap_usd=0.0), usdc_security())
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "market_cap")["pass"], False)
+
+    def test_top10_over_half_fails(self):
+        sec = dict(usdc_security(), top10_percent=0.62)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "top10")["pass"], False)
+
+    def test_missing_holder_data_is_unknown_not_a_fail(self):
+        sec = dict(usdc_security(), top10_percent=None, top_holders=[])
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "unknown")
+        self.assertIsNone(check_of(res, "top10")["pass"])
+        self.assertTrue(any("top10" in u for u in res["unknowns"]))
+
+    def test_a_honeypot_fails_and_high_tax_fails(self):
+        sec = dict(usdc_security(), is_honeypot=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "honeypot")["pass"], False)
+        sec = dict(usdc_security(), buy_tax=10.0)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertIs(check_of(res, "buy_tax")["pass"], False)
+        sec = dict(usdc_security(), sell_tax=6.0)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertIs(check_of(res, "sell_tax")["pass"], False)
+
+    def test_cannot_buy_fails(self):
+        sec = dict(usdc_security(), cannot_buy=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "cannot_buy")["pass"], False)
+
+    def test_a_proxy_is_a_passing_warning_not_a_failure(self):
+        sec = dict(usdc_security(), is_proxy=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "pass")
+        c = check_of(res, "is_proxy")
+        self.assertIs(c["pass"], True)
+        self.assertEqual(c["detail"], "proxy contract: upgradeable")
+
+    def test_no_security_is_unknown_never_a_pass(self):
+        res = check.check_crypto_meme(moon_pool(), None)
+        self.assertEqual(res["verdict"], "unknown")
+        self.assertIsNone(check_of(res, "honeypot")["pass"])
+        self.assertIsNone(check_of(res, "buy_tax")["pass"])
+        self.assertIsNone(check_of(res, "top10")["pass"])
+        self.assertTrue(res["unknowns"])
+        res = check.check_crypto_meme(moon_pool(), None,
+                                      {"security_unavailable_reason": EVM_REASON})
+        self.assertIn(EVM_REASON, " | ".join(res["unknowns"]))
+
+    def test_a_missing_tax_is_unknown(self):
+        sec = dict(usdc_security(), sell_tax=None)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "unknown")
+        self.assertIsNone(check_of(res, "sell_tax")["pass"])
+
+    def test_thresholds_come_from_the_config(self):
+        res = check.check_crypto_meme(moon_pool(), usdc_security(),
+                                      {"min_liquidity_usd": 60000.0})
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "liquidity")["pass"], False)
+
+    def test_unknown_market_cap_is_unknown_never_a_pass_on_the_fdv(self):
+        pool = dict(moon_pool(), market_cap_usd=0.0, market_cap_known=False, fdv_usd=750000.0)
+        res = check.check_crypto_meme(pool, usdc_security())
+        self.assertEqual(res["verdict"], "unknown")
+        self.assertIsNone(check_of(res, "market_cap")["pass"])
+        self.assertIn("unknown", check_of(res, "market_cap")["detail"])
+        self.assertTrue(any("market_cap" in u for u in res["unknowns"]))
+
+    def test_tiny_quantities_do_not_print_as_zero(self):
+        self.assertEqual(check._crypto_qty(0.0003972), "0.0003972")
+        self.assertEqual(check._crypto_qty(0.5), "0.50")
+        self.assertEqual(check._crypto_qty(50), "50")
+        self.assertEqual(check._crypto_qty(0.017902791), "0.02")
+
+    def test_a_clean_solana_token_passes_with_its_own_checks(self):
+        res = check.check_crypto_meme(moon_pool(), solana_security())
+        self.assertEqual(res["verdict"], "pass")
+        self.assertEqual(res["unknowns"], [])
+        self.assertEqual([c["name"] for c in res["checks"]],
+                         ["liquidity", "volume24h", "market_cap", "top10", "honeypot",
+                          "buy_tax", "sell_tax", "freeze_authority", "mint_authority",
+                          "rugcheck"])
+        self.assertIs(check_of(res, "freeze_authority")["pass"], True)
+        self.assertIs(check_of(res, "mint_authority")["pass"], True)
+        self.assertIs(check_of(res, "rugcheck")["pass"], True)
+        self.assertIn("7", check_of(res, "rugcheck")["detail"])
+
+    def test_solana_skips_the_checks_that_have_no_solana_meaning(self):
+        res = check.check_crypto_meme(moon_pool(), solana_security())
+        names = [c["name"] for c in res["checks"]]
+        self.assertNotIn("cannot_buy", names)
+        self.assertNotIn("is_proxy", names)
+
+    def test_a_set_freeze_authority_fails_on_solana(self):
+        sec = dict(solana_security(), freezable=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "freeze_authority")["pass"], False)
+        self.assertIn("freeze", check_of(res, "freeze_authority")["detail"])
+
+    def test_a_set_mint_authority_fails_on_solana(self):
+        sec = dict(solana_security(), mintable=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "mint_authority")["pass"], False)
+
+    def test_a_rugcheck_danger_fails_on_solana(self):
+        sec = dict(solana_security(), rugcheck_danger=["Freeze Authority enabled"])
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "rugcheck")["pass"], False)
+        self.assertIn("Freeze Authority enabled", check_of(res, "rugcheck")["detail"])
+
+    def test_an_unsellable_solana_token_is_a_honeypot(self):
+        sec = dict(solana_security(), is_honeypot=True)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "honeypot")["pass"], False)
+
+    def test_a_solana_transfer_fee_over_5_percent_fails(self):
+        sec = dict(solana_security(), buy_tax=6.0, sell_tax=6.0)
+        res = check.check_crypto_meme(moon_pool(), sec)
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIs(check_of(res, "sell_tax")["pass"], False)
+
+
+class CryptoCli(unittest.TestCase):
+    def test_solana_offline_passes_with_solana_security(self):
+        code, text, err = run_risk(["crypto", "--chain", "solana", "--pair", MOON_PAIR,
+                                    "--offline", SOL_DIR, "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["chain"], "solana")
+        self.assertEqual(doc["pool"]["symbol"], "MOON")
+        self.assertEqual(doc["verdict"], "pass")
+        self.assertEqual(doc["security"]["chain"], "solana")
+        self.assertIs(doc["security"]["is_honeypot"], False)
+        self.assertIs(doc["security"]["freezable"], False)
+        self.assertEqual(doc["security"]["rugcheck_score"], 7)
+        self.assertEqual(check_of(doc, "freeze_authority")["pass"], True)
+        self.assertEqual(check_of(doc, "rugcheck")["pass"], True)
+
+    def test_solana_offline_without_fixtures_is_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            pairs = load_json(os.path.join(SOL_DIR, "dexscreener-pairs.json"))
+            with open(os.path.join(d, "dexscreener-pairs.json"), "w") as fh:
+                json.dump(pairs, fh)
+            code, text, err = run_risk(["crypto", "--chain", "solana", "--pair", MOON_PAIR,
+                                        "--offline", d, "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["verdict"], "unknown")
+        self.assertIsNone(doc["security"])
+        # No fixture file at all: the reason names the missing files.
+        self.assertIn("no Solana security fixture in", " | ".join(doc["unknowns"]))
+
+    def test_base_offline_passes_with_goplus_data(self):
+        code, text, err = run_risk(["crypto", "--chain", "base", "--pair", BASE_PAIR,
+                                    "--token", USDC_ADDR, "--offline", BASE_DIR, "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["verdict"], "pass")
+        self.assertIs(doc["security"]["is_honeypot"], False)
+        self.assertEqual(check_of(doc, "is_proxy")["detail"], "proxy contract: upgradeable")
+
+    def test_text_mode_reports_the_verdict(self):
+        code, text, err = run_risk(["crypto", "--chain", "solana", "--pair", MOON_PAIR,
+                                    "--offline", SOL_DIR])
+        self.assertEqual(code, 0, err)
+        self.assertIn("PASS", text)
+        self.assertIn("freeze_authority", text)
+        self.assertIn("rugcheck", text)
+        self.assertIn("Verdict: PASS", text)
+        self.assertIn("not financial advice", text)
+
+    def test_a_thin_pool_fails_offline(self):
+        with tempfile.TemporaryDirectory() as d:
+            thin = {"pairs": [{"baseToken": {"address": "THINTOKEN", "name": "Thin", "symbol": "THIN"},
+                               "chainId": "solana", "dexId": "pumpswap", "pairAddress": "THINPAIR",
+                               "priceUsd": "0.001", "marketCap": 1000, "liquidity": {"usd": 100.0},
+                               "volume": {"h24": 50.0}}]}
+            with open(os.path.join(d, "dexscreener-pairs.json"), "w") as fh:
+                json.dump(thin, fh)
+            code, text, err = run_risk(["crypto", "--chain", "solana", "--pair", "THINPAIR",
+                                        "--offline", d, "--json"])
+            self.assertEqual(code, 1, err)
+            self.assertEqual(json.loads(text)["verdict"], "fail")
+
+    def test_unknown_chain_and_unknown_pair_fail(self):
+        code, _, err = run_risk(["crypto", "--chain", "nosuchchain", "--pair", MOON_PAIR,
+                                 "--offline", SOL_DIR, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("nosuchchain", err)
+        code, _, err = run_risk(["crypto", "--chain", "solana", "--pair", "NOPAIR",
+                                 "--offline", SOL_DIR, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("NOPAIR", err)
+
+    def test_unmatched_pair_falls_back_to_the_most_liquid_pool_for_the_token(self):
+        moon_token = "8UQdy5sHMVWUWSHeA5B3ZuuAVNumjSLPXdf19MXcpump"
+        code, text, err = run_risk(["crypto", "--chain", "solana", "--pair", "NOPAIR",
+                                    "--token", moon_token, "--offline", SOL_DIR, "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["pair"], MOON_PAIR)   # the 50000-liquidity pool, not OTHERPAIR
+        self.assertEqual(doc["pool"]["symbol"], "MOON")
+        self.assertIn("most liquid", doc["pool_note"])
+        self.assertIn("NOPAIR", doc["pool_note"])
+
+    def test_lowercase_evm_address_matches_the_same_pool(self):
+        # Live: DexScreener returns a checksummed pair address while the
+        # caller passes lowercase. That is the same pool, not a fallback.
+        with tempfile.TemporaryDirectory() as d:
+            doc = {"pairs": [{"baseToken": {"address": USDC_ADDR, "name": "USD Coin",
+                                            "symbol": "USDC"},
+                              "chainId": "base", "dexId": "uniswap-v3",
+                              "pairAddress": "0x000000000000000000000000000000000000BEEF",
+                              "priceUsd": "1.0", "marketCap": 1000000,
+                              "liquidity": {"usd": 50000.0}, "volume": {"h24": 10000.0}}]}
+            with open(os.path.join(d, "dexscreener-pairs.json"), "w") as fh:
+                json.dump(doc, fh)
+            shutil.copy(os.path.join(BASE_DIR, "goplus.json"),
+                        os.path.join(d, "goplus.json"))
+            code, text, err = run_risk(["crypto", "--chain", "base", "--pair",
+                                        "0x000000000000000000000000000000000000beef",
+                                        "--token", USDC_ADDR, "--offline", d, "--json"])
+            self.assertEqual(code, 0, err)
+            doc = json.loads(text)
+            self.assertEqual(doc["pair"], "0x000000000000000000000000000000000000BEEF")
+            self.assertIsNone(doc["pool_note"])  # same pool, no fallback note
+
+    def test_goplus_failure_degrades_to_unknown_not_exit_1(self):
+        real = crypto
+
+        class Stub(object):
+            DEX_TO_GT = real.DEX_TO_GT
+            GOPLUS_CHAINS = real.GOPLUS_CHAINS
+            DS_BASE = real.DS_BASE
+            CryptoError = real.CryptoError
+            fetch_json = staticmethod(real.fetch_json)
+            parse_dexscreener_pairs = staticmethod(real.parse_dexscreener_pairs)
+            parse_goplus_security = staticmethod(real.parse_goplus_security)
+
+            def fetch_dexscreener_token(self, address, pause=0.3):
+                return load_json(os.path.join(BASE_DIR, "dexscreener-pairs.json"))
+
+            def fetch_goplus_security(self, chain, addresses, pause=0.3):
+                raise real.CryptoError("GoPlus answered HTTP 429")
+
+        orig = check._crypto_module
+        check._crypto_module = lambda: Stub()
+        try:
+            code, text, err = run_risk(["crypto", "--chain", "base", "--pair", BASE_PAIR,
+                                        "--token", USDC_ADDR, "--json"])
+        finally:
+            check._crypto_module = orig
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["verdict"], "unknown")
+        self.assertIsNone(doc["security"])
+        self.assertIn("security sources did not answer (GoPlus answered HTTP 429)",
+                      " | ".join(doc["unknowns"]))
 
 
 if __name__ == "__main__":

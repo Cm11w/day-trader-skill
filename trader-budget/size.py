@@ -775,7 +775,12 @@ def write_orders(path, orders, cfg, source="", now_utc=None):
 def run_plan(a, cfg):
     now = parse_now(a.now)
     today = to_eastern(now).date().isoformat()
+    if a.plan is None:
+        a.plan = ("trader/plan-crypto.json" if a.asset == "crypto" else "trader/plan.json")
     plan = read_json(a.plan, "plan (run trader-exit first, or use --weights for a split)")
+    if isinstance(plan, dict) and plan.get("asset") == "crypto":
+        raise SizeError("this sizes stock day trades to the cent; %s is a crypto plan (no market close, "
+                        "no cents). Size it with trader-exit and trader-timemachine instead." % a.plan)
     limit = None
     if a.limit is not None:
         if a.limit == "plan":
@@ -807,7 +812,7 @@ def run_plan(a, cfg):
     s = size_trade(plan, cfg, a.budget, limit, price, cash, today)
     order = bracket_order(s)
     if order and a.write:
-        src = "trader/plan.json (%s %s %s)" % (s["symbol"], s["setup"] or "plan", s["date"] or today)
+        src = "%s (%s %s %s)" % (a.plan, s["symbol"], s["setup"] or "plan", s["date"] or today)
         write_orders(a.write, [order], cfg, src, now)
     if a.json:
         print(json.dumps({"sizing": s, "orders": [order] if order else [], "notes": notes}, indent=2))
@@ -846,7 +851,10 @@ def run_weights(a, cfg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Size a day trade to your budget and max loss (trader-budget).")
-    ap.add_argument("--plan", default="trader/plan.json", help="the trade plan (default trader/plan.json)")
+    ap.add_argument("--plan", default=None,
+                    help="the trade plan (default trader/plan.json, trader/plan-crypto.json for --asset crypto)")
+    ap.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                    help="stocks (default) or crypto (reads trader/plan-crypto.json)")
     ap.add_argument("--config", default="trader/config.json", help="rules (default trader/config.json)")
     ap.add_argument("--budget", type=float, help="override the budget in the config")
     ap.add_argument("--limit", nargs="?", const="plan", metavar="PRICE",

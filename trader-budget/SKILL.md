@@ -37,6 +37,11 @@ python3 "${CLAUDE_SKILL_DIR}/size.py" --weights AAPL=40,KO=60 --config split.jso
 `--now "2026-10-19 10:15"` pins the clock (New York time). A plan for
 another day is refused: make a new one with trader-exit.
 
+This sizes stock day trades to the cent, so a crypto plan is refused,
+not sized: `size.py --asset crypto` reads `trader/plan-crypto.json` and
+says to size it with trader-exit and trader-timemachine instead (a crypto
+plan has no market close and no cents).
+
 ## What it reads and writes
 
 | file | what |

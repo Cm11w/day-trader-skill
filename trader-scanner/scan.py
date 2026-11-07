@@ -72,6 +72,7 @@ import argparse
 import datetime
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -1027,6 +1028,111 @@ def _p(x):
     return "{:,.2f}".format(x)
 
 
+def _big(x):
+    """A dollar amount in short form: $2.00M, $120,000, $950."""
+    x = float(x)
+    if x >= 1000000:
+        return "$%.2fM" % (x / 1000000.0)
+    if x >= 1000:
+        return "${:,.0f}".format(x)
+    return "${:,.2f}".format(x)
+
+
+def _crypto_module():
+    """The shared crypto data module, next to this script. Imported lazily so
+    the stock commands never touch it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import crypto
+    return crypto
+
+
+def cmd_memes(a):
+    """Crypto meme scan: trending + new pools per chain (GeckoTerminal) plus
+    boosted tokens (DexScreener), filtered, deduped, most traded first.
+    Crypto trades 24/7, so the clock is UTC and there is no session."""
+    t0 = time.time()
+    crypto = _crypto_module()
+    now = crypto.parse_now_utc(a.now) if a.now else crypto.now_utc()
+    for name, value in (("--min-liquidity-usd", a.min_liquidity_usd),
+                        ("--min-volume24h-usd", a.min_volume24h_usd),
+                        ("--max-age-hours", a.max_age_hours),
+                        ("--min-marketcap-usd", a.min_marketcap_usd)):
+        if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+            raise ScanError("%s must be a finite number" % name)
+        if value < 0:
+            raise ScanError("%s must be at or above 0" % name)
+    if a.limit is not None and a.limit <= 0:
+        raise ScanError("--limit must be above 0")
+    if math.isnan(a.pause) or math.isinf(a.pause) or a.pause < 0:
+        raise ScanError("--pause must be a finite number at or above 0")
+    if a.show <= 0:
+        raise ScanError("--show must be above 0")
+    chains = [c.strip() for c in (a.chains or "").split(",") if c.strip()] or list(crypto.DEFAULT_CHAINS)
+    for c in chains:
+        if c not in crypto.DEX_TO_GT:
+            raise ScanError("unknown chain %s: %s" % (c, ", ".join(crypto.DEFAULT_CHAINS)))
+    if a.offline:
+        try:
+            pools, failed = crypto.load_offline_memes(a.offline, chains)
+        except crypto.CryptoError as e:
+            raise ScanError(str(e))
+    else:
+        progress(a, "Fetching trending and new pools for %s chains (%s)..."
+                 % (len(chains), ", ".join(chains)))
+        pools, failed = crypto.fetch_memes(chains, a.pause)
+    universe = len(pools)
+    pools = crypto.dedupe_pools(pools)
+    scanned = len(pools)
+    pools = crypto.apply_filters(pools, a.min_liquidity_usd, a.min_volume24h_usd,
+                                 a.max_age_hours, a.min_marketcap_usd, now)
+    pools = crypto.sort_pools(pools)
+    if a.limit:
+        pools = pools[:a.limit]
+    hits = [crypto.to_hit(p, now) for p in pools]
+    as_of = now.strftime("%Y-%m-%d %H:%M UTC")
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "mode": "memes", "as_of": as_of, "universe": universe, "scanned": scanned,
+           "failed": failed, "source": "geckoterminal+dexscreener",
+           "filters": {"min_liquidity_usd": a.min_liquidity_usd,
+                       "min_volume24h_usd": a.min_volume24h_usd,
+                       "max_age_hours": a.max_age_hours,
+                       "min_marketcap_usd": a.min_marketcap_usd},
+           "note": NOTE, "hits": hits}
+    if a.offline:
+        doc["offline"] = os.path.basename(a.offline.rstrip("/"))
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0 if hits else 1
+    print("Memes scan, %s, %d chains (GeckoTerminal trending + new, DexScreener boosts)."
+          % (as_of, len(chains)))
+    print("Fetched %s pools%s; %s after dedupe; %s passed the filters (liquidity %s+, "
+          "volume %s+/24h, age under %sh, market cap %s+)." % (
+              "{:,}".format(universe),
+              (" (%s sources failed)" % failed) if failed else "",
+              "{:,}".format(scanned), "{:,}".format(len(hits)), _big(a.min_liquidity_usd),
+              _big(a.min_volume24h_usd), _n(a.max_age_hours), _big(a.min_marketcap_usd)))
+    if hits:
+        print("Most traded first:")
+        for h in hits[:a.show]:
+            age = ("%.0fh old" % h["pair_age_hours"]) if h["pair_age_hours"] is not None else "age ?"
+            chg = ("%+.1f%%" % h["price_change_24h_pct"]) if h["price_change_24h_pct"] is not None else "?"
+            print("  %-8s %-8s %12s  mcap %s  liq %s  vol24h %s  %s  %s  %s" % (
+                h["symbol"], h["chain"], "${:,.8g}".format(h["price_usd"]), _big(h["market_cap_usd"]),
+                _big(h["liquidity_usd"]), _big(h["volume24h_usd"]), chg, age, h["dex"]))
+        if len(hits) > a.show:
+            print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
+    else:
+        print("No pools passed the filters.")
+    if not a.no_write:
+        print("Wrote %s (mode memes, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+    print(NOTE + " Next: pick one pool, then check it on DexScreener before anything else.")
+    return 0 if hits else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Chart Scanner (trader-scanner): daily setups and opening-range breakouts.")
     sub = ap.add_subparsers(dest="cmd")
@@ -1065,12 +1171,28 @@ def main(argv=None):
     p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
     p.add_argument("--config", default="trader/config.json")
+    p = sub.add_parser("memes", help="crypto meme pools: trending and new, all chains")
+    p.add_argument("--chains", help="comma-separated DexScreener chain ids (default: all 9)")
+    p.add_argument("--min-liquidity-usd", type=float, default=10000.0)
+    p.add_argument("--min-volume24h-usd", type=float, default=5000.0)
+    p.add_argument("--max-age-hours", type=float, default=168.0)
+    p.add_argument("--min-marketcap-usd", type=float, default=0.0)
+    p.add_argument("--limit", type=int, help="keep only the first N hits, most traded first")
+    p.add_argument("--offline", metavar="PATH", help="fixture folder instead of the network")
+    p.add_argument("--now", help='pretend it is this time ("2026-11-07 16:00" UTC, or ...Z)')
+    p.add_argument("--out", default="trader/watchlist-crypto.json")
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)
+    p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
+        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb,
+                "memes": cmd_memes}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1

@@ -54,6 +54,28 @@ reads saved quote files instead of the network.
 | `trader/prices.json` | the latest quotes, merged in, for trader-budget and trader-risk |
 | `trader/portfolio.json` | the tickers held, for `quote --holdings` |
 
+## Crypto quote
+
+A crypto quote is one DexScreener pool, not a stock ticker. It uses the
+same output shape as a stock quote (`price_usd`,
+`price_change_24h_pct`, `source` is `dexscreener`).
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --asset crypto --chain solana --pair ADDR
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --asset crypto --chain base --pair ADDR --token 0x... --json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --asset crypto --chain solana --pair ADDR --offline DIR
+```
+
+`--offline DIR` reads `dexscreener-pairs.json` from DIR instead of the
+network. Crypto quotes are never written to `trader/prices.json`
+(stocks only), and they never create an alert rule: `check` watches
+stock rules only. The default stays stocks: without `--asset crypto`,
+`quote` works exactly as before.
+
+`add --from-plan --asset crypto` reads `trader/plan-crypto.json` and
+makes stop and target rules only: a crypto plan has no market close, so
+there is no flat-by-close rule.
+
 ## Rule types
 
 | type | rings when | rings again |

@@ -120,6 +120,29 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 It never places an order, never sizes a position, never widens a stop to
 make a plan pass, and never calls a stop a guarantee.
 
+## Crypto: pools, not tickers
+
+Crypto trades 24/7, so there is no market close and no flat-by time. The
+clock is UTC and the data is GeckoTerminal OHLCV, free with no key, through
+the shared `trader-scanner/crypto.py` module.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --asset crypto --chain solana --pair ADDR --entry 0.0183
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --asset crypto --chain solana --pair ADDR --entry 0.0183 --offline ohlcv.json --json
+```
+
+- **Stop and target.** Stop = entry minus `--atr-mult` (default 2.0) times
+  ATR(14) on the last 5-minute bars; target = entry plus `--target-r`
+  (default 2.0) times the risk. All prices print at 8 significant digits.
+- **No flat by.** The plan's `flat_by` is none and it says so: "no market
+  close; exit on stop/target only". `--flat-by`, `--stop`, `--target`,
+  `--symbol` and `--from` are refused with crypto: use `--atr-mult` and
+  `--target-r` instead.
+- **Crypto writes go to `trader/plan-crypto.json`**, never the shared stock
+  file `trader/plan.json`; `show --asset crypto` reads the crypto file.
+- **`--offline FILE` reads a GeckoTerminal OHLCV JSON file**, the same shape
+  as `crypto.py ohlcv` writes. `--now` is UTC for crypto.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

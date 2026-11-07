@@ -14,9 +14,12 @@ from contextlib import redirect_stdout, redirect_stderr
 from _load import load, FIX
 
 tm = load("trader-timemachine", "timemachine")
+crypto = load("trader-scanner", "crypto")
 
 DIR = os.path.join(FIX, "trader-timemachine")
 TSLA = os.path.join(DIR, "TSLA-60d5m.json.gz")   # Yahoo v8 chart, range=60d interval=5m, fetched 2026-10-19 10:49 ET
+CFIX = os.path.join(DIR, "crypto-ohlcv.json")
+POOL = "8GjMy6ipYsXfMWwRPu9C7ATssorjg6AL88d9xtTZsLqe"
 with gzip.open(TSLA, "rt", encoding="utf-8") as _fh:
     TEXT = _fh.read()
 NOW = "2026-10-19 10:50"
@@ -608,6 +611,224 @@ class Cli(unittest.TestCase):
                                       "45.1 % of the replays hit neither by 4:00 PM; the price at 4:00 PM decides those."])
         code, again, _ = run(["chart", "--plan", self.plan, "--offline", TSLA, "--now", NOW])
         self.assertEqual(again, text)
+
+
+def crypto_bars(path=CFIX):
+    with open(path) as fh:
+        return crypto.parse_ohlcv(json.load(fh))
+
+
+def crypto_doc(**kw):
+    return tm.time_machine_crypto(crypto_bars(), "COGE",
+                                  crypto.parse_now_utc("2026-11-07 03:20"), source="offline", **kw)
+
+
+def synth_day(start, base, closes=None, lows=None, highs=None, n=288):
+    """One synthetic UTC day of 5-minute bars at base, with per-slot overrides."""
+    bars = []
+    for i in range(n):
+        c = (closes or {}).get(i, base)
+        bars.append({"t": start + 300 * i, "o": c, "h": (highs or {}).get(i, c + 0.0001),
+                     "l": (lows or {}).get(i, c - 0.0001), "c": c, "v": 1.0})
+    return bars
+
+
+class CryptoTimeMachine(unittest.TestCase):
+    def test_split_sessions_crypto_uses_midnight_utc(self):
+        days = tm.split_sessions_crypto(crypto_bars())
+        self.assertEqual(sorted(days), ["2026-11-04", "2026-11-05", "2026-11-06", "2026-11-07"])
+        self.assertEqual(len(days["2026-11-06"]), 288)
+        self.assertEqual(len(days["2026-11-07"]), 40)
+        self.assertEqual(days["2026-11-07"][0]["start"], "00:00")
+        self.assertEqual(days["2026-11-07"][39]["start"], "03:15")
+        self.assertEqual(days["2026-11-06"][287]["start"], "23:55")
+
+    def test_full_utc_days_before_the_entry_day(self):
+        days = tm.split_sessions_crypto(crypto_bars())
+        full, short = tm.full_sessions(days, "2026-11-07", session_bars=288)
+        self.assertEqual([d for d, _ in full], ["2026-11-04", "2026-11-05", "2026-11-06"])
+        self.assertEqual(short, [])   # the entry day itself is not a pool session
+
+    def test_the_crypto_run(self):
+        doc = crypto_doc(replays=2000)
+        p, m, h = doc["plan"], doc["mc"], doc["history"]
+        self.assertEqual(doc["source"], "offline")
+        self.assertEqual(doc["created_by"], "trader-timemachine")
+        self.assertEqual((p["symbol"], p["setup"], p["side"]), ("COGE", "crypto-breakout", "buy"))
+        self.assertEqual(p["date"], "2026-11-07")
+        self.assertEqual((p["entry_bar"], p["entry_time"]), (39, "3:20 AM"))
+        self.assertAlmostEqual(p["entry"], 0.01332596, places=8)
+        self.assertAlmostEqual(p["stop"], 0.01290666, places=8)
+        self.assertAlmostEqual(p["target"], 0.01416457, places=8)
+        self.assertEqual(p["target_r"], 2.0)
+        self.assertEqual((m["until"], m["bars_left"], m["pool_sessions"]), ("24:00", 248, 3))
+        self.assertEqual((m["pool_from"], m["pool_to"]), ("2026-11-04", "2026-11-06"))
+        self.assertEqual(m["replays"], 2000)
+        self.assertAlmostEqual(m["p_target"] + m["p_stop"] + m["p_neither"], 1.0, places=6)
+        self.assertEqual(h["sessions"], 3)
+        self.assertEqual(h["rule"]["setup"], "crypto-breakout")
+        self.assertEqual(h["rule"]["stop_rule"], "atr")
+        self.assertEqual((h["rule"]["atr_mult"], h["rule"]["target_r"]), (2.0, 2.0))
+        self.assertEqual((h["triggered"], h["target"], h["stop"], h["close"]), (1, 0, 1, 0))
+        self.assertEqual(h["trades"][0]["date"], "2026-11-04")
+        self.assertEqual(h["trades"][0]["outcome"], "stop")
+        self.assertIn("3.1 days", doc["data"]["range"])
+        self.assertIn("only 3 full UTC day", doc["warnings"][0])
+        self.assertIn("under the 24h high", doc["warnings"][1])
+        self.assertIsInstance(doc["verdict"], str)
+        text = "\n".join(tm.report(doc))
+        self.assertIn("COGE buy, Saturday 2026-11-07: entry 0.01332596 at 3:20 AM (bar 39)", text)
+        self.assertIn("248 five-minute bars", text)
+        self.assertIn("3 full sessions", text)
+        self.assertIn("24h-high breakout", text)
+
+    def test_same_seed_same_numbers(self):
+        a = crypto_doc(replays=500, seed=5)["mc"]
+        b = crypto_doc(replays=500, seed=5)["mc"]
+        self.assertEqual(a, b)
+
+    def test_days_caps_the_pool(self):
+        doc = crypto_doc(replays=200, days=1)
+        self.assertEqual(doc["mc"]["pool_sessions"], 1)
+        self.assertEqual(doc["mc"]["pool_from"], "2026-11-06")
+        self.assertEqual(doc["history"]["sessions"], 1)
+
+    def test_a_pool_younger_than_one_full_day_is_refused(self):
+        bars = [b for b in crypto_bars() if b["t"] >= 1794009600]  # 2026-11-07 only
+        with self.assertRaises(tm.TMError) as cm:
+            tm.time_machine_crypto(bars, "COGE", crypto.parse_now_utc("2026-11-07 03:20"), replays=100)
+        self.assertIn("full UTC day", str(cm.exception))
+
+    def test_cli_run_offline_json(self):
+        code, text, err = run(["run", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                               "--offline", CFIX, "--now", "2026-11-07 03:20Z", "--replays", "500", "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual(doc["plan"]["symbol"], "COGE")
+        self.assertEqual(doc["mc"]["pool_sessions"], 3)
+        self.assertEqual(doc["mc"]["bars_left"], 248)
+        self.assertNotIn("sample_paths", doc["mc"])
+
+    def test_cli_run_text(self):
+        code, text, err = run(["run", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                               "--offline", CFIX, "--now", "2026-11-07 03:20Z", "--replays", "500"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("COGE buy, Saturday 2026-11-07: entry 0.01332596 at 3:20 AM (bar 39)", text)
+        self.assertIn("3 full sessions", text)
+        self.assertIn("UTC day", text)
+
+    def test_cli_refusals(self):
+        code, _, err = run(["run", "--asset", "crypto", "--chain", "nosuch", "--pair", POOL,
+                            "--offline", CFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("unknown chain nosuch", err)
+        code, _, err = run(["run", "--asset", "crypto", "--chain", "solana", "--offline", CFIX])
+        self.assertEqual(code, 1)
+        self.assertIn("--pair", err)
+        code, _, err = run(["run", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                            "--offline", CFIX, "--days", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("--days", err)
+
+    def test_history_replays_the_breakout_not_the_opening_range(self):
+        # Four pool days: no trigger, close, stop, target; entry day 2026-11-07.
+        bars = []
+        bars += synth_day(1793664000, 0.0100)                                            # 11-03: flat
+        bars += synth_day(1793750400, 0.0100, closes={i: 0.0120 for i in range(100, 288)})  # 11-04: breakout, flat
+        bars += synth_day(1793836800, 0.0130, lows={101: 0.0120})                          # 11-05: breakout, drop
+        bars += synth_day(1793923200, 0.0140, highs={101: 0.0151})                         # 11-06: breakout, rise
+        bars += synth_day(1794009600, 0.0140, n=40)                                        # 11-07: entry day
+        doc = tm.time_machine_crypto(bars, "TEST", crypto.parse_now_utc("2026-11-07 03:20"),
+                                     replays=100, days=4, source="offline")
+        h = doc["history"]
+        self.assertEqual(h["rule"]["setup"], "crypto-breakout")
+        self.assertEqual(h["rule"]["stop_rule"], "atr")
+        self.assertEqual((h["sessions"], h["triggered"]), (4, 3))
+        self.assertEqual((h["target"], h["stop"], h["close"]), (1, 1, 1))
+        self.assertEqual(h["green"], 1)
+        self.assertAlmostEqual(h["avg_R"], 1.0 / 3.0, places=3)
+        by_date = {t["date"]: t for t in h["trades"]}
+        self.assertEqual((by_date["2026-11-04"]["outcome"], by_date["2026-11-04"]["R"]), ("close", 0.0))
+        self.assertEqual((by_date["2026-11-05"]["outcome"], by_date["2026-11-05"]["R"]), ("stop", -1.0))
+        self.assertEqual((by_date["2026-11-06"]["outcome"], by_date["2026-11-06"]["R"]), ("target", 2.0))
+        self.assertNotIn("2026-11-03", by_date)   # never closed above its 24h high
+
+    def test_build_pool_skips_a_zero_previous_close(self):
+        day = [{"o": 1.0, "h": 1.0, "l": 1.0, "c": 0.0}] + [
+            {"o": 1.0, "h": 1.1, "l": 0.9, "c": 1.0} for _ in range(287)]
+        pool = tm.build_pool([("2026-11-04", day)], session_bars=288)
+        self.assertEqual(len(pool), 288)
+        self.assertEqual(pool[1], [(1.0, 1.0, 1.0, 1.0)])   # no ratio from a $0 close
+        self.assertEqual(pool[2][0], (1.0, 1.1, 0.9, 1.0))
+
+    def test_simulate_keeps_significant_digits_on_tiny_prices(self):
+        pool = [[(1.0, 1.0, 1.0, 1.0)] for _ in range(288)]
+        mc = tm.simulate(pool, 0.000000004, 0.000000003, 0.000000006, 0, 287, replays=100, seed=19,
+                         window=0, session_bars=288, sig_digits=8)
+        self.assertEqual(mc["median_close"], 0.000000004)
+        self.assertEqual(mc["p5_close"], 0.000000004)
+        self.assertEqual(mc["sample_paths"][0][1], 0.000000004)
+        self.assertEqual(mc["hist"]["lo"], 0.000000004)
+
+    def test_entry_at_the_last_bar_closes_at_midnight_next_day(self):
+        bars = []
+        for day in range(4):
+            bars += synth_day(1793664000 + day * 86400, 0.0100)
+        doc = tm.time_machine_crypto(bars, "TEST", crypto.parse_now_utc("2026-11-07 00:00"),
+                                     replays=100, days=3, source="offline")
+        self.assertEqual(doc["plan"]["entry_bar"], 287)
+        self.assertEqual(doc["plan"]["entry_time"], "12:00 AM (next day)")
+        self.assertEqual(tm.close_clock(1435), "11:55 PM")
+        self.assertEqual(tm.close_clock(1440), "12:00 AM (next day)")
+
+    def test_cli_live_fetch_pages_for_five_days_by_default(self):
+        seen = {}
+        real = crypto
+
+        class Stub(object):
+            DEX_TO_GT = real.DEX_TO_GT
+            CryptoError = real.CryptoError
+            parse_now_utc = staticmethod(real.parse_now_utc)
+            now_utc = staticmethod(real.now_utc)
+            parse_ohlcv = staticmethod(real.parse_ohlcv)
+
+            def fetch_ohlcv_paged(self, network, pair, timeframe, aggregate, limit, pause=0.3):
+                seen["limit"] = limit
+                with open(CFIX) as fh:
+                    return json.load(fh)
+
+        orig = tm._crypto_module
+        tm._crypto_module = lambda: Stub()
+        try:
+            code, text, err = run(["run", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                                   "--now", "2026-11-07 03:20Z", "--replays", "100", "--json"])
+        finally:
+            tm._crypto_module = orig
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen["limit"], 6 * 288)   # (default --days 5 + 1) x 288 bars
+
+    def test_crypto_write_defaults_to_timemachine_crypto_json(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            code, text, err = run(["run", "--asset", "crypto", "--chain", "solana", "--pair", POOL,
+                                   "--offline", CFIX, "--now", "2026-11-07 03:20Z", "--replays", "100",
+                                   "--write"])
+            self.assertEqual(code, 0, err)
+            self.assertTrue(os.path.exists(os.path.join("trader", "timemachine-crypto.json")))
+            self.assertFalse(os.path.exists(os.path.join("trader", "timemachine.json")))
+            code, text, err = run(["chart", "--asset", "crypto",
+                                   "--from", os.path.join("trader", "timemachine-crypto.json")])
+            self.assertEqual(code, 0, err)
+        finally:
+            os.chdir(cwd)
+            shutil.rmtree(d)
+
+    def test_nan_atr_mult_is_rejected(self):
+        with self.assertRaises(tm.TMError):
+            tm.time_machine_crypto(crypto_bars(), "COGE", crypto.parse_now_utc("2026-11-07 03:20"),
+                                   replays=100, atr_mult=float("nan"))
 
 
 if __name__ == "__main__":

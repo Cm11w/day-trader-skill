@@ -12,6 +12,9 @@ a limit together are caught.
     python3 check.py --now "2026-10-19 10:15"        # pin the clock (New York time)
     python3 check.py --orders trader/orders.json --json
     python3 check.py --no-write                      # check without recording the verdicts
+    python3 check.py crypto --chain solana --pair ADDR   # one meme pool: liquidity,
+                                                           # volume, market cap, honeypot
+                                                           # and taxes (see "Crypto meme check")
 
 Entries and exits. An ENTRY opens or adds to a position (a buy, or a sell
 that would go short). An EXIT only reduces what you hold. Getting out must
@@ -126,6 +129,341 @@ EARLY = datetime.time(13, 0)
 
 class RiskError(Exception):
     pass
+
+
+# ---------------------------------------------------------------- crypto meme check
+
+CRYPTO_DEFAULTS = {
+    "min_liquidity_usd": 10000.0,
+    "min_volume24h_usd": 5000.0,
+    "max_top10_percent": 50.0,
+    "max_tax_pct": 5.0,
+}
+
+
+def _crypto_module():
+    """The shared crypto data module in trader-scanner, next to this skill.
+    Imported lazily so the stock check never touches it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    scanner = os.path.normpath(os.path.join(here, "..", "trader-scanner"))
+    if scanner not in sys.path:
+        sys.path.insert(0, scanner)
+    import crypto
+    return crypto
+
+
+def _crypto_fetch(crypto, fn, *args):
+    """One shared-layer fetch, with a CryptoError turned into a RiskError."""
+    try:
+        return fn(*args)
+    except crypto.CryptoError as e:
+        raise RiskError(str(e))
+
+
+def _crypto_num(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _crypto_qty(value):
+    value = float(value)
+    if value == int(value):
+        return str(int(value))
+    if abs(value) >= 0.01:
+        return "%.2f" % value
+    return "%.8g" % value
+
+
+def _pick_pool(pools, pair, token):
+    """The requested pair, or (when --token is given and the pair is not
+    among the returned pools) the most liquid pool for that token, with a
+    note saying so. (None, None) when neither matches."""
+    for p in pools:
+        if p.get("pair_address") == pair:
+            return p, None
+    if pair and pair.startswith("0x"):  # EVM addresses differ in case only;
+        for p in pools:                 # the pool is the same one (base58 is case-sensitive)
+            if (p.get("pair_address") or "").lower() == pair.lower():
+                return p, None
+    if token:
+        same = [p for p in pools if (p.get("token_address") or "").lower() == token.lower()]
+        if same:
+            best = max(same, key=lambda p: _crypto_num(p.get("liquidity_usd")))
+            return best, ("--pair %s is not among the pools for token %s: using the most liquid "
+                          "pair %s instead" % (pair, token, best.get("pair_address")))
+    return None, None
+
+
+def check_crypto_meme(pool, security, cfg=None):
+    """Pure function. Risk-check one crypto meme pool against fixed floors.
+
+    pool      a normalized pool dict (crypto.parse_dexscreener_pairs)
+    security  a parsed GoPlus record (crypto.parse_goplus_security), or None
+              when no security data is available
+    cfg       optional overrides: min_liquidity_usd, min_volume24h_usd,
+              max_top10_percent, max_tax_pct, security_unavailable_reason
+
+    Thresholds (defaults): liquidity_usd at least 10000; volume24h_usd at
+    least 5000; market_cap_usd over 0 when the market cap is known (an
+    unknown market cap is UNKNOWN, never a pass on the FDV: the FDV is a
+    different number); the top 10 holders at most 50 percent of the supply
+    when holder data is present (missing holder data is UNKNOWN, never a
+    fail); is_honeypot must be False; buy_tax and sell_tax at most 5 percent
+    each when present; cannot_buy must be False. A proxy contract (is_proxy
+    True) is a warning, not a failure: the check passes with the detail
+    "proxy contract: upgradeable". Any check without the data to judge it is
+    UNKNOWN (pass None) and is listed in "unknowns".
+
+    Solana records (chain "solana", from GoPlus Solana + RugCheck + a
+    Jupiter sell quote) add three checks of their own and skip the two
+    that have no Solana meaning (cannot_buy, is_proxy): freeze_authority
+    fails when the freeze authority is still set (the authority can freeze
+    any holder's account), mint_authority fails when the mint authority is
+    still set (new supply can be minted), and rugcheck fails when RugCheck
+    reports a danger-level risk. The honeypot check for Solana is the
+    merged verdict: a transfer hook, or no Jupiter sell route (or an absurd
+    price impact on a tiny probe), means honeypot; it passes only when
+    GoPlus sees no hook AND Jupiter finds a sell route.
+
+    Returns {"checks": [{"name", "pass", "detail"}], "verdict", "unknowns"}.
+    The verdict is "fail" when any check fails, "unknown" when nothing
+    fails but something is UNKNOWN, else "pass".
+    """
+    c = dict(CRYPTO_DEFAULTS)
+    c.update(cfg or {})
+    pool = pool or {}
+    reason = c.get("security_unavailable_reason") or "no GoPlus security record for this token"
+    checks, unknowns = [], []
+    is_sol = bool(security) and security.get("chain") == "solana"
+
+    def add(name, passed, detail):
+        checks.append({"name": name, "pass": passed, "detail": detail})
+        if passed is None:
+            unknowns.append(name + ": " + detail)
+
+    liq = _crypto_num(pool.get("liquidity_usd"))
+    min_liq = float(c["min_liquidity_usd"])
+    add("liquidity", liq >= min_liq,
+        "liquidity_usd %s (min %s)" % (_crypto_qty(liq), _crypto_qty(min_liq)) if liq >= min_liq
+        else "liquidity_usd %s is under min %s" % (_crypto_qty(liq), _crypto_qty(min_liq)))
+    vol = _crypto_num(pool.get("volume24h_usd"))
+    min_vol = float(c["min_volume24h_usd"])
+    add("volume24h", vol >= min_vol,
+        "volume24h_usd %s (min %s)" % (_crypto_qty(vol), _crypto_qty(min_vol)) if vol >= min_vol
+        else "volume24h_usd %s is under min %s" % (_crypto_qty(vol), _crypto_qty(min_vol)))
+    mcap = _crypto_num(pool.get("market_cap_usd"))
+    if pool.get("market_cap_known") is False:
+        add("market_cap", None, "market cap is unknown (only the FDV is published); cannot judge it")
+    else:
+        add("market_cap", mcap > 0,
+            "market_cap_usd %s (must be over 0)" % _crypto_qty(mcap) if mcap > 0
+            else "market_cap_usd %s is not over 0" % _crypto_qty(mcap))
+    top10 = None if security is None else security.get("top10_percent")
+    if top10 is None:
+        add("top10", None, "no holder data: " + reason)
+    else:
+        pct = float(top10) * 100.0
+        cap = float(c["max_top10_percent"])
+        add("top10", pct <= cap,
+            "top 10 holders own %s%% (max %s%%)" % (_crypto_qty(pct), _crypto_qty(cap))
+            if pct <= cap
+            else "top 10 holders own %s%%, over the %s%% max" % (_crypto_qty(pct), _crypto_qty(cap)))
+    if security is None:
+        add("honeypot", None, reason)
+    elif security.get("is_honeypot") is None:
+        add("honeypot", None, "is_honeypot is unknown: " + reason)
+    elif security.get("is_honeypot"):
+        add("honeypot", False, "is_honeypot is True")
+    else:
+        add("honeypot", True, "not a honeypot")
+    max_tax = float(c["max_tax_pct"])
+    for key in ("buy_tax", "sell_tax"):
+        tax = None if security is None else security.get(key)
+        if tax is None:
+            add(key, None, "no tax data: " + reason if security is None
+                else key + " is missing")
+        else:
+            tax = float(tax)
+            add(key, tax <= max_tax,
+                "%s %s%% (max %s%%)" % (key, _crypto_qty(tax), _crypto_qty(max_tax)) if tax <= max_tax
+                else "%s %s%% is over the %s%% max" % (key, _crypto_qty(tax), _crypto_qty(max_tax)))
+    if not is_sol:
+        if security is None:
+            add("cannot_buy", None, reason)
+        elif security.get("cannot_buy") is None:
+            add("cannot_buy", None, "cannot_buy is unknown: " + reason)
+        elif security.get("cannot_buy"):
+            add("cannot_buy", False, "cannot_buy is True: the token cannot be bought")
+        else:
+            add("cannot_buy", True, "can be bought")
+        if security is None:
+            add("is_proxy", None, reason)
+        elif security.get("is_proxy") is None:
+            add("is_proxy", None, "is_proxy is unknown: " + reason)
+        elif security.get("is_proxy"):
+            add("is_proxy", True, "proxy contract: upgradeable")
+        else:
+            add("is_proxy", True, "not a proxy contract")
+    if is_sol:
+        if security.get("freezable") is None:
+            add("freeze_authority", None, "no freeze authority data")
+        elif security.get("freezable"):
+            add("freeze_authority", False,
+                "freeze authority is set: the authority can freeze holder accounts")
+        else:
+            add("freeze_authority", True, "freeze authority is not set")
+        if security.get("mintable") is None:
+            add("mint_authority", None, "no mint authority data")
+        elif security.get("mintable"):
+            add("mint_authority", False,
+                "mint authority is set: new supply can be minted")
+        else:
+            add("mint_authority", True, "mint authority is not set")
+        danger = security.get("rugcheck_danger") or []
+        score = security.get("rugcheck_score")
+        if score is None and not danger:
+            add("rugcheck", None, "no RugCheck data")
+        elif danger:
+            add("rugcheck", False, "RugCheck danger: " + ", ".join(danger))
+        else:
+            add("rugcheck", True, "RugCheck score %s (lower is safer), no danger risks"
+                % _crypto_qty(score))
+    if any(ch["pass"] is False for ch in checks):
+        verdict = "fail"
+    elif any(ch["pass"] is None for ch in checks):
+        verdict = "unknown"
+    else:
+        verdict = "pass"
+    return {"checks": checks, "verdict": verdict, "unknowns": unknowns}
+
+
+def crypto_report(res):
+    """The text form of a crypto meme check."""
+    pool = res["pool"]
+    chg = pool.get("price_change_24h_pct")
+    lines = ["%s (%s, %s)  $%s%s" % (pool.get("symbol") or "?", res["chain"], pool.get("dex") or "?",
+                                     "{:,.8g}".format(_crypto_num(pool.get("price_usd"))),
+                                     ("  %+.2f%% 24h" % chg) if chg is not None else "")]
+    if res.get("pool_note"):
+        lines.append("Note: " + res["pool_note"] + ".")
+    for ch in res["checks"]:
+        word = "PASS" if ch["pass"] is True else ("FAIL" if ch["pass"] is False else "UNKNOWN")
+        lines.append("  %s %-10s %s" % (word, ch["name"], ch["detail"]))
+    lines.append("")
+    lines.append("Verdict: %s" % res["verdict"].upper())
+    lines.append("Education and tooling, not financial advice.")
+    return "\n".join(lines)
+
+
+def run_crypto_check(argv):
+    """`check.py crypto --chain <chain> --pair <pool> [--token <addr>]
+    [--offline DIR] [--json]`. Exit 1 only when the verdict is fail."""
+    ap = argparse.ArgumentParser(description="Risk-check one crypto meme pool (trader-risk).")
+    ap.add_argument("--chain", required=True, help="DexScreener chain id, e.g. solana or base")
+    ap.add_argument("--pair", required=True, help="pool address")
+    ap.add_argument("--token", help="token address (live fetch; offline it is read from the pool)")
+    ap.add_argument("--offline", metavar="DIR",
+                    help="read dexscreener-pairs.json and goplus.json from this folder, no network")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    try:
+        crypto = _crypto_module()
+        chain = a.chain
+        if chain not in crypto.DEX_TO_GT:
+            raise RiskError("unknown chain %s: %s" % (chain, ", ".join(crypto.DEFAULT_CHAINS)))
+        if a.offline:
+            pools = crypto.parse_dexscreener_pairs(
+                read_json(os.path.join(a.offline, "dexscreener-pairs.json"), "dexscreener pairs file"))
+            pool, pool_note = _pick_pool(pools, a.pair, a.token)
+            if pool is None:
+                raise RiskError("no pool %s in %s" % (a.pair, a.offline))
+            token = a.token or pool.get("token_address") or ""
+            security = None
+            goplus_error = None
+            if chain in crypto.GOPLUS_CHAINS:
+                gpath = os.path.join(a.offline, "goplus.json")
+                if os.path.exists(gpath):
+                    security = crypto.parse_goplus_security(read_json(gpath, "goplus file"), token)
+            elif chain == "solana":
+                goplus = rugcheck = jupiter = None
+                missing = []
+                gpath = os.path.join(a.offline, "goplus-solana.json")
+                if os.path.exists(gpath):
+                    goplus = crypto.parse_goplus_solana(read_json(gpath, "goplus-solana file"),
+                                                        token)
+                else:
+                    missing.append("goplus-solana.json")
+                rpath = os.path.join(a.offline, "rugcheck.json")
+                if os.path.exists(rpath):
+                    rugcheck = crypto.parse_rugcheck(read_json(rpath, "rugcheck file"))
+                else:
+                    missing.append("rugcheck.json")
+                jpath = os.path.join(a.offline, "jupiter.json")
+                if os.path.exists(jpath):
+                    jupiter = crypto.parse_jupiter_quote(read_json(jpath, "jupiter file"))
+                else:
+                    missing.append("jupiter.json")
+                security = crypto.merge_solana_security(goplus, rugcheck, jupiter)
+                if security is None:
+                    goplus_error = "no Solana security fixture in %s (%s)" % (
+                        a.offline, ", ".join(missing))
+        else:
+            if a.token:
+                doc = _crypto_fetch(crypto, crypto.fetch_dexscreener_token, a.token)
+            else:
+                doc = _crypto_fetch(crypto, crypto.fetch_json,
+                                    "%s/latest/dex/pairs/%s/%s" % (crypto.DS_BASE, chain, a.pair))
+            pools = crypto.parse_dexscreener_pairs(doc)
+            pool, pool_note = _pick_pool(pools, a.pair, a.token)
+            if pool is None:
+                if a.token:
+                    raise RiskError("no pool %s for token %s" % (a.pair, a.token))
+                raise RiskError("DexScreener has no pool %s on %s" % (a.pair, chain))
+            token = a.token or pool.get("token_address") or ""
+            security = None
+            goplus_error = None
+            if chain in crypto.GOPLUS_CHAINS and token:
+                try:
+                    security = crypto.parse_goplus_security(
+                        crypto.fetch_goplus_security(chain, [token]), token)
+                except crypto.CryptoError as e:
+                    # GoPlus is one source, not the check: a 429/500 degrades
+                    # to security UNKNOWN (exit 0) instead of killing the run.
+                    goplus_error = str(e)
+            elif chain == "solana" and token:
+                try:
+                    security, errs = crypto.fetch_solana_security(token)
+                except crypto.CryptoError as e:
+                    goplus_error = str(e)
+                else:
+                    if security is None and errs:
+                        goplus_error = "; ".join("%s: %s" % (k, v)
+                                                for k, v in sorted(errs.items()))
+        cfg = None
+        if security is None:
+            if goplus_error:
+                reason = "security sources did not answer (%s): security UNKNOWN" % goplus_error
+            elif chain in crypto.GOPLUS_CHAINS:
+                reason = "no GoPlus security record for this token"
+            elif chain == "solana":
+                reason = ("no Solana security data (GoPlus Solana, RugCheck and Jupiter "
+                          "did not answer)")
+            else:
+                reason = "no security source covers chain %s" % chain
+            cfg = {"security_unavailable_reason": reason}
+        res = check_crypto_meme(pool, security, cfg)
+        out = {"chain": chain, "pair": pool.get("pair_address"), "token": token, "pool": pool,
+               "security": security, "checks": res["checks"], "verdict": res["verdict"],
+               "unknowns": res["unknowns"], "pool_note": pool_note}
+        print(json.dumps(out, indent=2) if a.json else crypto_report(out))
+        return 1 if res["verdict"] == "fail" else 0
+    except RiskError as e:
+        print("check.py: %s" % e, file=sys.stderr)
+        return 1
 
 
 # ---------------------------------------------------------------- time (New York, no tz files)
@@ -766,6 +1104,9 @@ def load_prices(pdoc):
 
 
 def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "crypto":
+        return run_crypto_check(args[1:])
     ap = argparse.ArgumentParser(description="Check proposed orders against your limits (trader-risk).")
     ap.add_argument("--orders", default="trader/orders.json")
     ap.add_argument("--config", default="trader/config.json")

@@ -1,0 +1,13 @@
+# Crypto majors as Yahoo Finance tickers. Use with the stock daily scan:
+# python3 trader-scanner/scan.py daily --universe trader-scanner/crypto-universe.txt
+# Yahoo has daily bars for these; meme coins are not on Yahoo, use `memes` for those.
+BTC-USD|Bitcoin
+ETH-USD|Ethereum
+SOL-USD|Solana
+BNB-USD|BNB
+XRP-USD|XRP
+DOGE-USD|Dogecoin
+ADA-USD|Cardano
+AVAX-USD|Avalanche
+LINK-USD|Chainlink
+DOT-USD|Polkadot

@@ -132,6 +132,37 @@ is `/trader-exit`), never moves the level after the fact, and never counts a
 bar that has not closed. It never runs `/trader-broker` from a background
 watch: nobody is there to say yes.
 
+## Crypto: pools, not tickers
+
+Crypto trades 24/7, so there is no open, no close and no opening range. The
+clock is UTC and the data is GeckoTerminal OHLCV, free with no key, through
+the shared `trader-scanner/crypto.py` module.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check --asset crypto --chain solana --pair ADDR
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check --asset crypto --chain solana --pair ADDR --offline ohlcv.json --json
+```
+
+- **The setup is `crypto-breakout`.** The level is the high of the last
+  24 hours (86,400 seconds) before the latest closed bar's close, whatever
+  the interval: `--limit` defaults to 1440 bars at 1m, 288 at 5m, 96 at
+  15m, and the fetch pages past GeckoTerminal's 1000-bar cap. The trigger
+  is the latest closed bar closing above that high. A close exactly at the
+  high is not a trigger.
+- **Stop and target come with the trigger.** Stop = entry minus
+  `--atr-mult` (default 2.0) times ATR(14) on the fetched bars; target =
+  entry plus `--target-r` (default 2.0) times the risk. Both print with the
+  trigger, at 8 significant digits, so a $0.017 coin reads $0.017, not $0.02.
+  When the ATR stop would be wider than the entry price there is no usable
+  stop, so the check reports NO STOP instead of a trigger and nothing is
+  placed.
+- **`--now` is UTC for crypto** (New York time for stocks). `--interval 1m`
+  fetches 1-minute bars; 5m is the default.
+- **`--offline FILE` reads a GeckoTerminal OHLCV JSON file**, the same shape
+  as `crypto.py ohlcv` writes. `--write` saves `trader/entry-crypto.json`
+  (not `trader/entry.json`, so the stock entry is never overwritten).
+- `watch` is stocks only. For crypto, re-run `check` on a `/loop`.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

@@ -6,6 +6,8 @@ moment to get in. Standard library only. Long side only. It never places an orde
     python3 entry.py check TSLA --now "2026-10-19 10:15" --offline TSLA.json
     python3 entry.py check TSLA --setup level --level 371.20    # first close above a price
     python3 entry.py check TSLA --interval 1m --min-volume-x 1.5 --write
+    python3 entry.py check --asset crypto --chain solana --pair ADDR   # 24h-high breakout, 5m bars, UTC
+    python3 entry.py check --asset crypto --chain solana --pair ADDR --offline ohlcv.json --json
     python3 entry.py watch TSLA --every 30 --until 15:30  # one line per closed bar
     python3 entry.py watchlist                            # every hit in trader/watchlist.json
 
@@ -54,6 +56,7 @@ import argparse
 import datetime
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -552,6 +555,158 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     return res
 
 
+def crypto_price(x):
+    """A crypto price in print: 8 significant digits, so 0.017 stays 0.017, not 0.02."""
+    return "$%.8g" % float(x)
+
+
+def price_str(res, x):
+    """A price the way this result prints it: cents for stocks, 8 digits for crypto."""
+    if res.get("asset") == "crypto":
+        return crypto_price(x)
+    return "$%.2f" % float(x)
+
+
+def _crypto_module():
+    """The shared crypto data module, in trader-scanner next to this skill."""
+    here = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-scanner"))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import crypto
+    return crypto
+
+
+def _read_crypto_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError:
+        raise EntryError("no offline file %s" % path)
+    except ValueError as e:
+        raise EntryError("%s is not valid JSON: %s" % (path, e))
+
+
+def _crypto_symbol(doc, pair):
+    try:
+        sym = ((doc.get("meta") or {}).get("base") or {}).get("symbol") or ""
+    except AttributeError:
+        sym = ""
+    return sym.strip().upper() or pair
+
+
+def atr_crypto(bars, n=14):
+    """Average true range of the last n bars (all of them if fewer). Same
+    Wilder math as trader-exit atr_of: the first bar uses its own high-low."""
+    trs, prev = [], None
+    for b in bars:
+        tr = b["h"] - b["l"]
+        if prev is not None:
+            tr = max(tr, abs(b["h"] - prev), abs(b["l"] - prev))
+        trs.append(tr)
+        prev = b["c"]
+    use = trs[-n:]
+    return sum(use) / len(use), len(use)
+
+
+def evaluate_crypto(series, now_utc, atr_mult=2.0, target_r=2.0):
+    """Pure function: the crypto-breakout status at now_utc (naive UTC) from
+    OHLCV bars, oldest first in the series. Crypto trades 24/7, so there is
+    no session, no opening range and no close: the level is the highest high
+    of the 24 hours before the latest closed bar's close, the trigger is the
+    latest closed bar closing above it, the stop is atr_mult x ATR(14) under
+    the entry and the target is target_r x the risk above it. The result
+    mirrors evaluate() so entry_doc and describe can be reused: same status,
+    trigger, last and forming shapes, plus asset, chain, pair, atr, stop and
+    target. A close above the level with no usable stop (the ATR stop is at
+    or under zero) is status "no-stop", never "triggered": there is no entry
+    without a stop."""
+    meta = series.get("meta") or {}
+    interval = meta.get("interval") or "5m"
+    if interval not in INTERVALS:
+        raise EntryError("--interval is 5m or 1m")
+    for name, value in (("--atr-mult", atr_mult), ("--target-r", target_r)):
+        if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+            raise EntryError("%s must be a finite number" % name)
+    if atr_mult <= 0:
+        raise EntryError("--atr-mult must be above 0")
+    if target_r <= 0:
+        raise EntryError("--target-r must be above 0")
+    step = INTERVALS[interval]
+    now_ts = ts_of(now_utc)
+    bars, forming = [], None
+    for i in range(len(series["t"])):
+        t = series["t"][i]
+        if t % step:
+            continue
+        start = utc_of(t)
+        end = start + datetime.timedelta(seconds=step)
+        b = {"t": int(t), "o": float(series["o"][i]), "h": float(series["h"][i]),
+             "l": float(series["l"][i]), "c": float(series["c"][i]),
+             "v": series["v"][i], "et": start, "end": end, "slot": len(bars)}
+        if t + step <= now_ts:
+            bars.append(b)
+        elif t <= now_ts and forming is None:
+            forming = {"bar_start": hm(start), "closes": ampm(end), "price": b["c"]}
+    res = {"symbol": meta.get("symbol") or "CRYPTO", "asset": "crypto",
+           "chain": meta.get("chain"), "pair": meta.get("pair"),
+           "setup": "crypto-breakout", "side": "buy", "date": now_utc.date().isoformat(),
+           "interval": interval, "or_minutes": None,
+           "now": now_utc.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
+           "phase": "open", "reason": "", "opening_range": None, "level": None,
+           "trigger": None, "last": None, "forming": forming, "min_volume_x": None,
+           "prev_close": None, "calendar_known": True, "_bars": bars,
+           "bars_closed": len(bars), "data_time": None, "atr_mult": atr_mult,
+           "target_r": target_r, "atr": None, "atr_bars": None, "stop": None, "target": None}
+    if len(bars) < 3:
+        res.update(status="no-data",
+                   reason="need at least 3 closed %s bars, got %d" % (interval, len(bars)))
+        return res
+    last = bars[-1]
+    res["data_time"] = last["end"].strftime("%Y-%m-%d %H:%M:%S")
+    res["prev_close"] = bars[-2]["c"]
+    window_start = last["end"] - datetime.timedelta(seconds=86400)
+    window = [b for b in bars[:-1] if b["end"] > window_start]
+    if not window:
+        res.update(status="no-data",
+                   reason="no earlier bars in the last 24h (the data is stale or gapped)")
+        return res
+    level = max(b["h"] for b in window)
+    if level <= 0:
+        res.update(status="no-data",
+                   reason="the 24h high is $0: the bars carry no usable prices")
+        return res
+    res["level"] = level
+    res["last"] = {"bar_start": hm(last["et"]), "close": last["c"],
+                   "vs_level_pct": r2(100.0 * (last["c"] / level - 1))}
+    atr, atr_n = atr_crypto(bars)
+    res["atr"] = atr
+    res["atr_bars"] = atr_n
+    if last["c"] > level:
+        entry_px = last["c"]
+        stop = entry_px - atr_mult * atr
+        res["trigger"] = {"time": ampm(last["end"]), "close_time": hm(last["end"]),
+                          "bar_start": hm(last["et"]), "bar_index": last["slot"],
+                          "price": entry_px, "close": entry_px, "volume": last["v"],
+                          "volume_x": None, "pct_over": r2(100.0 * (entry_px / level - 1))}
+        res["minutes_since"] = int((now_utc - last["end"]).total_seconds() // 60)
+        if stop > 0:
+            res["stop"] = stop
+            res["target"] = entry_px + target_r * (entry_px - stop)
+            res.update(status="triggered",
+                       reason="the %s bar closed above the 24h high %s" % (hm(last["et"]), crypto_price(level)))
+        else:
+            res.update(status="no-stop",
+                       reason="the %s bar closed above the 24h high %s, but no usable stop: "
+                              "%.1f x ATR is wider than the entry price" % (hm(last["et"]),
+                                                                            crypto_price(level), atr_mult))
+        return res
+    gap = level - last["c"]
+    res["reason"] = "last close %s (%s bar), %s under the 24h high %s (%+.2f%%)" % (
+        crypto_price(last["c"]), hm(last["et"]), crypto_price(gap), crypto_price(level),
+        100.0 * (last["c"] / level - 1))
+    return res
+
+
 def public(res):
     """The result without the internal bar list, ready for JSON."""
     return {k: v for k, v in res.items() if not k.startswith("_")}
@@ -561,12 +716,19 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
-            "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
-            "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
-            "interval": res["interval"],
-            "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+    doc = {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+           "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
+           "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
+           "interval": res["interval"],
+           "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
+           "source": "geckoterminal" if res.get("asset") == "crypto" else "yahoo",
+           "checked_at": iso(now_utc), "reason": res.get("reason")}
+    if res.get("asset") == "crypto":
+        doc["chain"] = res.get("chain")
+        doc["pair"] = res.get("pair")
+        doc["stop"] = res.get("stop")
+        doc["target"] = res.get("target")
+    return doc
 
 
 def write_json(path, doc):
@@ -580,7 +742,8 @@ def write_json(path, doc):
 
 # ---------------------------------------------------------------- words
 
-LABEL = {"triggered": "TRIGGERED", "waiting": "WAITING", "expired": "EXPIRED", "no-data": "NO DATA"}
+LABEL = {"triggered": "TRIGGERED", "waiting": "WAITING", "expired": "EXPIRED", "no-data": "NO DATA",
+         "no-stop": "NO STOP"}
 PHASE_LABEL = {"pre-open": "NOT OPEN YET", "forming": "RANGE FORMING", "closed": "MARKET CLOSED"}
 SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 
@@ -588,15 +751,21 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 def setup_name(res):
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
-    return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
+    if res["setup"] == "crypto-breakout":
+        return "crypto breakout (24h high)"
+    return "close above %s" % price_str(res, res["level"]) if res["level"] is not None else "close above a level"
 
 
 def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    if res.get("asset") == "crypto":
+        head = "%s  %s %s UTC  %s on %s bars (GeckoTerminal, free, can lag)" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    else:
+        head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -609,32 +778,49 @@ def describe(res):
             "" if orr["complete"] else ", still forming"))
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
-    if t:
-        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
-            t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
+    if t and res["status"] == "no-stop":
+        out.append("NO STOP %s: the %s bar (bar %d) closed above the 24h high %s (%+.2f%%), but "
+                   "%.1f x ATR(%d) %s is wider than the entry price, so there is no usable stop "
+                   "and no entry." % (t["time"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")),
+                                      t["bar_index"], price_str(res, res["level"]), t["pct_over"],
+                                      res["atr_mult"], res["atr_bars"], price_str(res, res["atr"])))
+        out.append("Nothing was placed.")
+    elif t:
+        what = ("the range high" if res["setup"] == "orb" else
+                "the 24h high" if res["setup"] == "crypto-breakout" else "the level")
+        out.append("TRIGGERED %s at %s: the %s bar (bar %d) closed above %s %s (%+.2f%%%s)." % (
+            t["time"], price_str(res, t["price"]), short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+            what, price_str(res, res["level"]), t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+        if res.get("asset") == "crypto" and res.get("stop") is not None:
+            out.append("Stop %s (%.1f x ATR(%d) %s), target %s (%.1fR)." % (
+                price_str(res, res["stop"]), res["atr_mult"], res["atr_bars"], price_str(res, res["atr"]),
+                price_str(res, res["target"]), res["target_r"]))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
-            out.append("That was %d minutes ago; the last close is $%.2f (%s bar). A late entry is a different "
+            out.append("That was %d minutes ago; the last close is %s (%s bar). A late entry is a different "
                        "trade: the price, the stop distance and the odds have moved." % (
-                           res["minutes_since"], res["last"]["close"], res["last"]["bar_start"]))
+                           res["minutes_since"], price_str(res, res["last"]["close"]), res["last"]["bar_start"]))
         if res.get("data_note"):
             out.append(res["data_note"] + ".")
         if res.get("minutes_since", 0) > step:
             out.append("Nothing was placed.")
         else:
             out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
-        out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
-                   "(exit.py plan --from trader/entry.json).")
+        if res.get("asset") == "crypto":
+            out.append("Next: set the stop and target BEFORE you buy: exit.py plan --asset crypto --chain %s "
+                       "--pair %s --entry %.8g." % (res.get("chain"), res.get("pair"), t["price"]))
+        else:
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
     else:
         out.append("%s  %s." % (label, res["reason"]))
         f = res.get("forming")
         if res.get("lag_note") and res["status"] == "waiting":
             out.append(res["lag_note"] + ".")
         elif f and res["status"] == "waiting" and res["phase"] in ("open", "forming"):
-            out.append("The %s bar is still forming ($%.2f so far, closes %s); it does not count until it closes." % (
-                f["bar_start"].lstrip("0"), f["price"], f["closes"]))
+            out.append("The %s bar is still forming (%s so far, closes %s); it does not count until it closes." % (
+                f["bar_start"].lstrip("0"), price_str(res, f["price"]), f["closes"]))
         if res["status"] == "expired":
             out.append("No entry on this setup today. Nothing was placed.")
         if res.get("next_open"):
@@ -804,7 +990,56 @@ def _load(a, sym, now):
     return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
 
 
+def cmd_check_crypto(a):
+    """check --asset crypto: the crypto-breakout status of one pool, on UTC time."""
+    crypto = _crypto_module()
+    if a.chain not in crypto.DEX_TO_GT:
+        raise EntryError("unknown chain %s: %s" % (a.chain, ", ".join(crypto.DEFAULT_CHAINS)))
+    if not a.pair:
+        raise EntryError("--asset crypto needs --pair POOL_ADDRESS (the GeckoTerminal pool address)")
+    if a.atr_mult <= 0:
+        raise EntryError("--atr-mult must be above 0")
+    if a.target_r <= 0:
+        raise EntryError("--target-r must be above 0")
+    try:
+        now = crypto.parse_now_utc(a.now) if a.now else crypto.now_utc()
+    except crypto.CryptoError as e:
+        raise EntryError(str(e))
+    aggregate = INTERVALS[a.interval] // 60
+    limit = a.limit if a.limit is not None else 86400 // INTERVALS[a.interval]
+    if limit <= 0:
+        raise EntryError("--limit must be above 0")
+    try:
+        if a.offline:
+            doc = _read_crypto_json(a.offline)
+        else:
+            doc = crypto.fetch_ohlcv_paged(crypto.DEX_TO_GT[a.chain], a.pair, "minute",
+                                           aggregate, limit)
+    except crypto.CryptoError as e:
+        raise EntryError(str(e))
+    series = crypto.ohlcv_to_series(crypto.parse_ohlcv(doc))
+    series["meta"] = {"symbol": _crypto_symbol(doc, a.pair), "chain": a.chain, "pair": a.pair,
+                      "interval": a.interval}
+    res = evaluate_crypto(series, now, a.atr_mult, a.target_r)
+    path = None
+    if a.write:
+        path = a.write if a.write != "trader/entry.json" else "trader/entry-crypto.json"
+        write_json(path, entry_doc(res, now))
+    if a.json:
+        print(json.dumps(public(res), indent=2))
+    else:
+        for line in describe(res):
+            print(line)
+        if path:
+            print("Wrote %s (status %s)." % (path, res["status"]))
+    return 0 if res["status"] == "triggered" else 1
+
+
 def cmd_check(a):
+    if getattr(a, "asset", "stocks") == "crypto":
+        return cmd_check_crypto(a)
+    if not a.symbol:
+        raise EntryError("check needs a symbol, e.g. entry.py check TSLA (or --asset crypto --chain solana --pair ADDR)")
     cfg = read_config(a.config)
     opts = _opts(a, cfg)
     sym = a.symbol.upper()
@@ -927,10 +1162,18 @@ def main(argv=None):
         p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("check", help="the setup's status right now")
-    p.add_argument("symbol")
+    p.add_argument("symbol", nargs="?", help="stocks only: the ticker")
     common(p)
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto (a pool, --chain and --pair)")
+    p.add_argument("--chain", default="solana", help="crypto only: DexScreener chain id")
+    p.add_argument("--pair", help="crypto only: the pool address")
+    p.add_argument("--limit", type=int, default=None,
+                   help="crypto only: OHLCV bars to fetch (default 1440 for 1m, 288 for 5m: 24h of bars)")
+    p.add_argument("--atr-mult", type=float, default=2.0, help="crypto only: stop distance in ATRs")
+    p.add_argument("--target-r", type=float, default=2.0, help="crypto only: target in multiples of the risk")
     p.add_argument("--write", nargs="?", const="trader/entry.json", metavar="PATH",
-                   help="save the result (default trader/entry.json)")
+                   help="save the result (default trader/entry.json, trader/entry-crypto.json for crypto)")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("watch", help="poll bar by bar until it triggers or expires")
     p.add_argument("symbol")

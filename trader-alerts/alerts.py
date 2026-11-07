@@ -3,6 +3,7 @@
 
     python3 alerts.py clock                          # is the NYSE open? next open / close
     python3 alerts.py quote TSLA --write             # quotes -> trader/prices.json
+    python3 alerts.py quote --asset crypto --chain solana --pair ADDR   # one meme pool, DexScreener
     python3 alerts.py quote --holdings --write       # every ticker in your portfolio and plan
     python3 alerts.py add --from-plan                # stop, target and flat-by-close from trader/plan.json
     python3 alerts.py add --symbol TSLA --stop 358.32
@@ -372,6 +373,57 @@ def _read(path, default):
         raise AlertError("%s is not valid JSON: %s" % (path, e))
 
 
+def _crypto_module():
+    """The shared crypto data module in trader-scanner, next to this skill.
+    Imported lazily so the stock commands never touch it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    scanner = os.path.normpath(os.path.join(here, "..", "trader-scanner"))
+    if scanner not in sys.path:
+        sys.path.insert(0, scanner)
+    import crypto
+    return crypto
+
+
+def get_crypto_quote(chain, pair, token=None, offline=None):
+    """One DexScreener pool -> a quote in the stock shape (price, price_usd,
+    price_change_24h_pct, source dexscreener). Offline reads
+    DIR/dexscreener-pairs.json; live fetches by token when given, else by
+    the pool address."""
+    crypto = _crypto_module()
+    if chain not in crypto.DEX_TO_GT:
+        raise AlertError("unknown chain %s: %s" % (chain, ", ".join(crypto.DEFAULT_CHAINS)))
+    try:
+        if offline:
+            path = os.path.join(offline, "dexscreener-pairs.json")
+            if not os.path.exists(path):
+                raise AlertError("no offline crypto pairs file %s" % path)
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        elif token:
+            doc = crypto.fetch_dexscreener_token(token)
+        else:
+            doc = crypto.fetch_json("%s/latest/dex/pairs/%s/%s" % (crypto.DS_BASE, chain, pair))
+    except OSError as e:
+        raise AlertError("could not read %s: %s" % (path if offline else "DexScreener", e))
+    except ValueError as e:
+        raise AlertError("%s is not valid JSON: %s" % (path if offline else "DexScreener", e))
+    except crypto.CryptoError as e:
+        raise AlertError(str(e))
+    pool = None
+    for p in crypto.parse_dexscreener_pairs(doc):
+        if p.get("pair_address") == pair:
+            pool = p
+            break
+    if pool is None:
+        raise AlertError("no pool %s on %s" % (pair, chain))
+    return {"symbol": pool.get("symbol") or "", "price": pool.get("price_usd", 0.0),
+            "price_usd": pool.get("price_usd", 0.0), "open": None, "high": None, "low": None,
+            "prev_close": None, "price_change_24h_pct": pool.get("price_change_24h_pct"),
+            "time": "", "source": "dexscreener", "chain": chain,
+            "pair_address": pool.get("pair_address") or "",
+            "token_address": pool.get("token_address") or ""}
+
+
 # ---------------------------------------------------------------- rules
 
 PRICE_TYPES = {"above", "below", "stop", "target", "pct_move", "opening_bell", "time"}
@@ -498,7 +550,8 @@ def _n(x):
 
 
 def rules_from_plan(plan, cfg_flat_by=None):
-    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day."""
+    """trader/plan.json -> a stop alert, a target alert and a flat-by-close time alert, for the plan's day.
+    A crypto plan has no market close, so it gets the stop and target alerts only."""
     if not isinstance(plan, dict) or not plan.get("symbol"):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
@@ -510,11 +563,12 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:55"
-    if _hhmm(flat) is None:
-        raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by close", "before_close": True})
+    if plan.get("asset") != "crypto":
+        flat = plan.get("flat_by") or cfg_flat_by or "15:55"
+        if _hhmm(flat) is None:
+            raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
+        out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                    "label": "flat by close", "before_close": True})
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])
@@ -559,7 +613,30 @@ def cmd_clock(a):
     return 0 if st["open"] else 1
 
 
+def cmd_quote_crypto(a):
+    """`quote --asset crypto --chain <chain> --pair <pool>`: one DexScreener
+    pool, in the same shape as a stock quote. Crypto quotes are never
+    written to trader/prices.json (stocks only)."""
+    if not a.pair:
+        raise AlertError("a crypto quote needs --pair (the pool address)")
+    if a.write:
+        raise AlertError("a crypto quote is not written to trader/prices.json (stocks only)")
+    q = get_crypto_quote(a.chain or "solana", a.pair, a.token, a.offline)
+    quotes = {q["symbol"]: q}
+    if a.json:
+        print(json.dumps({"quotes": quotes, "errors": []}, indent=2))
+    else:
+        chg = ""
+        if q.get("price_change_24h_pct") is not None:
+            chg = " (%+.2f%% 24h)" % q["price_change_24h_pct"]
+        print("%-6s $%s%s  [%s]" % (q["symbol"], "{:,.8g}".format(q["price_usd"]), chg, q["source"]))
+        print("Quotes are free, delayed and unofficial: for alerts only. Your broker's price is the one that fills.")
+    return 0
+
+
 def cmd_quote(a):
+    if getattr(a, "asset", "stock") == "crypto":
+        return cmd_quote_crypto(a)
     syms = _dedupe([s.upper() for s in a.symbols] + (holdings(a) if a.holdings else []))
     if not syms:
         raise AlertError("which tickers? alerts.py quote TSLA KO, or --holdings")
@@ -626,6 +703,8 @@ def cmd_add(a):
     doc = _read(a.rules, {"rules": []})
     doc.setdefault("rules", [])
     if a.from_plan:
+        if a.plan is None:
+            a.plan = ("trader/plan-crypto.json" if a.asset == "crypto" else "trader/plan.json")
         plan = _read(a.plan, None)
         if plan is None:
             raise AlertError("no plan at %s (run trader-exit first)" % a.plan)
@@ -731,6 +810,11 @@ def main(argv=None):
     p = sub.add_parser("quote", help="latest delayed quotes")
     net(p)
     p.add_argument("symbols", nargs="*")
+    p.add_argument("--asset", default="stock", choices=["stock", "crypto"],
+                   help="stock tickers (default) or one crypto pool")
+    p.add_argument("--chain", default="solana", help="DexScreener chain id for a crypto quote")
+    p.add_argument("--pair", help="pool address for a crypto quote")
+    p.add_argument("--token", help="token address for a crypto quote (live fetch)")
     p.add_argument("--holdings", action="store_true", help="add tickers from your portfolio and plan")
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--plan", default="trader/plan.json")
@@ -755,7 +839,10 @@ def main(argv=None):
     g.add_argument("--opening-bell", action="store_true")
     g.add_argument("--at", metavar="HH:MM", help="a time alert, New York time")
     g.add_argument("--from-plan", action="store_true", help="stop, target and flat-by-close from the plan")
-    p.add_argument("--plan", default="trader/plan.json")
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto (reads trader/plan-crypto.json for --from-plan)")
+    p.add_argument("--plan", default=None,
+                   help="the plan file (default trader/plan.json, trader/plan-crypto.json for --asset crypto)")
     p.add_argument("--config", default="trader/config.json", help="flat_by when the plan has none")
     p.add_argument("--label", help="what a time alert says, e.g. \"flat by close\"")
     p.add_argument("--before-close", action="store_true",
