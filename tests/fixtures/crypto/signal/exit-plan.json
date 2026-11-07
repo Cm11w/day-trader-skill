@@ -1,0 +1,1 @@
+{"asset":"crypto","chain":"robinhood","date":"2026-11-07","entry":0.001651,"pair":"0x51c9a331b57ac985e5b66849ae04a755a9f6257d2b88ae951f9e5a1c7116e6a7","reward_risk":2.0,"risk_per_share":0.00016,"setup":"level","side":"buy","stop":0.001491,"stop_label":"2.0 x ATR(14)","stop_rule":"atr","symbol":"CLAUS","target":0.001971,"target_label":"2R","target_r":2.0}

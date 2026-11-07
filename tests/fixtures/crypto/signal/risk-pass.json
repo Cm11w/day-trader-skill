@@ -1,0 +1,66 @@
+{
+  "chain": "base",
+  "checks": [
+    {
+      "detail": "likuiditas $336.263 >= $10.000",
+      "name": "liquidity",
+      "pass": true
+    },
+    {
+      "detail": "volume 24j $5.347.118 >= $5.000",
+      "name": "volume",
+      "pass": true
+    },
+    {
+      "detail": "bukan honeypot",
+      "name": "honeypot",
+      "pass": true
+    }
+  ],
+  "pair": "0x0000000000000000000000000000000000000002",
+  "pool": {
+    "chain": "base",
+    "liquidity_usd": 336263.0,
+    "pair_address": "0x0000000000000000000000000000000000000002",
+    "price_change_24h_pct": 12.0,
+    "symbol": "DENIM",
+    "volume24h_usd": 5347118.0
+  },
+  "pool_note": "",
+  "security": {
+    "is_honeypot": false,
+    "buy_tax": 0.0,
+    "sell_tax": 0.0,
+    "cannot_buy": false,
+    "is_proxy": true,
+    "is_open_source": true,
+    "holder_count": 11521634,
+    "top_holders": [
+      {
+        "address": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
+        "percent": 0.054639230401827485,
+        "balance": 231234992.576844,
+        "is_locked": false,
+        "is_contract": true
+      },
+      {
+        "address": "0xb026ba5501c9fcdb5b4b746c37e349cd61b81b22",
+        "percent": 0.03750157541460603,
+        "balance": 158707881.660177,
+        "is_locked": false,
+        "is_contract": false
+      },
+      {
+        "address": "0x8da91a6298ea5d1a8bc985e99798fd0a0f05701a",
+        "percent": 0.037406325174016555,
+        "balance": 158304779.55728,
+        "is_locked": false,
+        "is_contract": false
+      }
+    ],
+    "top10_percent": 0.12954713099045007
+  },
+  "token": "0x0000000000000000000000000000000000000003",
+  "unknowns": [],
+  "verdict": "pass"
+}

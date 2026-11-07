@@ -156,6 +156,41 @@ and never calls a result a sure thing. It never prints a P&L or a profit.
 It never uses a bar that has not closed yet, and never mixes today's bars
 into the pool.
 
+## Crypto: UTC days, not NYSE sessions
+
+Crypto trades 24/7, so a "session" is one UTC day, midnight to midnight,
+288 five-minute bars. The clock is UTC and the data is GeckoTerminal OHLCV,
+free with no key, through the shared `trader-scanner/crypto.py` module.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --asset crypto --chain solana --pair ADDR --days 3
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --asset crypto --chain solana --pair ADDR --offline ohlcv.json --json
+```
+
+- **Paged fetch, limit 1000 per page.** GeckoTerminal returns at most 1000
+  bars per request, so the run pages backwards past that cap (at most 10
+  pages) to cover the days asked for. The run says how many days that is
+  in its output.
+- **The plan is built from the data.** Entry = the latest closed bar's
+  close, stop = 2.0 x ATR(14) under it, target = 2.0 x the risk above it.
+  The rest of that UTC day is replayed from the full UTC days before it
+  (`--days`, default 5). The history replay runs the crypto plan's own
+  setup on those days: a 24h-high breakout with an ATR stop (entry = the
+  first bar closing above the prior 24h high, stop = 2.0 x ATR(14) under
+  it, target = 2.0 x the risk above it), not the stock opening range.
+  A day whose close is stamped 12:00 AM closes at midnight the next day.
+- **Thin pools are normal.** A young pool may hold only 1 to 3 full UTC
+  days, so the run warns when the pool holds fewer than 5 full days and
+  treats the odds as rough. It refuses when there is not even one full UTC
+  day. When the latest close is under the 24h high it warns and replays a
+  plan-ahead entry instead of refusing.
+- **Prices print at 8 significant digits**, not 8 decimal places, so a
+  $0.0000001234 price keeps its digits instead of rounding to $0.00000012.
+- **Crypto writes go to `trader/timemachine-crypto.json`**, never the
+  shared stock file `trader/timemachine.json`.
+- **`--offline FILE` reads a GeckoTerminal OHLCV JSON file**, the same shape
+  as `crypto.py ohlcv` writes. `--now` is UTC for crypto.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

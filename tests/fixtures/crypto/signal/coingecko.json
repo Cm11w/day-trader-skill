@@ -1,0 +1,18 @@
+{
+  "community_data": {
+    "facebook_likes": null,
+    "reddit_subscribers": null,
+    "telegram_channel_user_count": null,
+    "twitter_followers": 1200
+  },
+  "id": "claus",
+  "links": {
+    "twitter_screen_name": "contractclaus"
+  },
+  "name": "CLAUS",
+  "symbol": "claus",
+  "market_data": {
+    "circulating_supply": 500000000.0,
+    "total_supply": 1000000000.0
+  }
+}

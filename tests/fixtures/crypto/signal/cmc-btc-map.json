@@ -1,0 +1,234 @@
+{
+  "data": [
+    {
+      "id": 1,
+      "name": "Bitcoin",
+      "symbol": "BTC",
+      "slug": "bitcoin",
+      "rank": 1,
+      "is_active": 1,
+      "first_historical_data": "2010-07-13T00:05:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": null
+    },
+    {
+      "id": 38552,
+      "name": "Bitcoin Base",
+      "symbol": "BTC",
+      "slug": "bitcoin-base",
+      "rank": 3160,
+      "is_active": 1,
+      "first_historical_data": "2025-09-29T23:30:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 199,
+        "name": "Base",
+        "symbol": "-",
+        "slug": "base",
+        "token_address": "0xFaF1C31F6855E91B1a905761C81A79e4966e4709"
+      }
+    },
+    {
+      "id": 38692,
+      "name": "Bitcoin Second Chance",
+      "symbol": "BTC",
+      "slug": "bitcoin-second-chance",
+      "rank": 3409,
+      "is_active": 1,
+      "first_historical_data": "2025-10-13T11:10:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 14,
+        "name": "BNB Smart Chain (BEP20)",
+        "symbol": "BNB",
+        "slug": "bnb",
+        "token_address": "0x0afcb0065362ec8bc94902479b9d37e3fa49eda6"
+      }
+    },
+    {
+      "id": 38133,
+      "name": "Bitcoin AI",
+      "symbol": "BTC",
+      "slug": "bitcoin-ai",
+      "rank": 3566,
+      "is_active": 1,
+      "first_historical_data": "2025-08-18T11:25:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 14,
+        "name": "BNB Smart Chain (BEP20)",
+        "symbol": "BNB",
+        "slug": "bnb",
+        "token_address": "0xf22aac87E08d7FC60aA89eb21110ddfE59c20854"
+      }
+    },
+    {
+      "id": 42691,
+      "name": "Big Titty Coin",
+      "symbol": "BTC",
+      "slug": "big-titty-coin",
+      "rank": 3882,
+      "is_active": 1,
+      "first_historical_data": "2026-10-28T09:35:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 300,
+        "name": "Robinhood Chain",
+        "symbol": "-",
+        "slug": "robinhood-placeholder",
+        "token_address": "0xA5B562D13486735D2a96D6B230489B1F33731440"
+      }
+    },
+    {
+      "id": 38601,
+      "name": "Bitcoin X (tokenxoff.xyz)",
+      "symbol": "BTC",
+      "slug": "bitcoin-x-tokenxoff-xyz",
+      "rank": 7267,
+      "is_active": 1,
+      "first_historical_data": "2025-10-07T08:00:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 14,
+        "name": "BNB Smart Chain (BEP20)",
+        "symbol": "BNB",
+        "slug": "bnb",
+        "token_address": "0x5c1b89F02CDae86EDe019d6b2AE071E456f4f804"
+      }
+    },
+    {
+      "id": 38650,
+      "name": "Bitcoin Inu (tokeninu.xyz)",
+      "symbol": "BTC",
+      "slug": "bitcoin-inu-tokeninu-xyz",
+      "rank": 7276,
+      "is_active": 1,
+      "first_historical_data": "2025-10-10T07:50:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 14,
+        "name": "BNB Smart Chain (BEP20)",
+        "symbol": "BNB",
+        "slug": "bnb",
+        "token_address": "0xe993278fF97C505098dEC831Afb9f4afF2526698"
+      }
+    },
+    {
+      "id": 39579,
+      "name": "Bitcoin Gold AI",
+      "symbol": "BTC",
+      "slug": "bitcoin-gold-ai",
+      "rank": 7435,
+      "is_active": 1,
+      "first_historical_data": "2026-02-16T07:10:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 14,
+        "name": "BNB Smart Chain (BEP20)",
+        "symbol": "BNB",
+        "slug": "bnb",
+        "token_address": "0x4b5ae1fb0d931cfa5cdd697da8548e4530157ad4"
+      }
+    },
+    {
+      "id": 39556,
+      "name": "Bridged BTC (NEAR Intents)",
+      "symbol": "BTC",
+      "slug": "bridged-btc-near-intents",
+      "rank": 8019,
+      "is_active": 1,
+      "first_historical_data": "2026-01-29T07:50:00.000Z",
+      "last_historical_data": "2026-11-07T11:45:00.000Z",
+      "platform": {
+        "id": 60,
+        "name": "Near",
+        "symbol": "NEAR",
+        "slug": "near-protocol",
+        "token_address": "btc.omft.near"
+      }
+    },
+    {
+      "id": 30938,
+      "name": "Satoshi Pumpomoto",
+      "symbol": "BTC",
+      "slug": "satoshi-pumpomoto",
+      "rank": null,
+      "is_active": 0,
+      "platform": {
+        "id": 16,
+        "name": "Solana",
+        "symbol": "SOL",
+        "slug": "solana",
+        "token_address": "6AGNtEgBE2jph1bWFdyaqsXJ762emaP9RE17kKxEsfiV"
+      }
+    },
+    {
+      "id": 31469,
+      "name": "Boost Trump Campaign",
+      "symbol": "BTC",
+      "slug": "boost-trump-campaign",
+      "rank": null,
+      "is_active": 0,
+      "platform": {
+        "id": 1,
+        "name": "Ethereum",
+        "symbol": "ETH",
+        "slug": "ethereum",
+        "token_address": "0x300e0d87f8c95d90cfe4b809baa3a6c90e83b850"
+      }
+    },
+    {
+      "id": 31652,
+      "name": "batcat",
+      "symbol": "BTC",
+      "slug": "batcat",
+      "rank": null,
+      "is_active": 0,
+      "platform": {
+        "id": 16,
+        "name": "Solana",
+        "symbol": "SOL",
+        "slug": "solana",
+        "token_address": "EtBc6gkCvsB9c6f5wSbwG8wPjRqXMB5euptK6bqG1R4X"
+      }
+    },
+    {
+      "id": 32295,
+      "name": "Bullish Trump Coin",
+      "symbol": "BTC",
+      "slug": "bullish-trump-coin",
+      "rank": null,
+      "is_active": 0,
+      "platform": {
+        "id": 1,
+        "name": "Ethereum",
+        "symbol": "ETH",
+        "slug": "ethereum",
+        "token_address": "0x43FD9De06bb69aD771556E171f960A91c42D2955"
+      }
+    },
+    {
+      "id": 34316,
+      "name": "HarryPotterTrumpSonic100Inu",
+      "symbol": "BTC",
+      "slug": "harrypottertrumpsonic100inu",
+      "rank": null,
+      "is_active": 0,
+      "platform": {
+        "id": 1,
+        "name": "Ethereum",
+        "symbol": "ETH",
+        "slug": "ethereum",
+        "token_address": "0x7099aB9E42Fa7327a6b15E0a0c120c3e50d11BeC"
+      }
+    }
+  ],
+  "status": {
+    "timestamp": "2026-11-07T11:47:51.515Z",
+    "error_code": 0,
+    "error_message": null,
+    "elapsed": 1,
+    "credit_count": 0,
+    "notice": null
+  }
+}

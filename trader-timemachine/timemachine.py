@@ -11,6 +11,8 @@ session in the data.
     python3 timemachine.py run --seed 7 --replays 20000 --json
     python3 timemachine.py run --symbol TSLA --date 2026-10-19 --entry 364.18 \\
         --stop 358.32 --target 370.04 --entry-time "10:15 AM"
+    python3 timemachine.py run --asset crypto --chain solana --pair ADDR --days 3
+    python3 timemachine.py run --asset crypto --chain solana --pair ADDR --offline ohlcv.json --json
     python3 timemachine.py chart                        # ASCII fan chart of the replays
     python3 timemachine.py chart --from trader/timemachine.json
 
@@ -176,6 +178,7 @@ def parse_clock(text, what):
 
 def clock12(minutes):
     h, m = divmod(minutes, 60)
+    h %= 24     # 24:00 is midnight, 12:00 AM, not 12:00 PM
     return "%d:%02d %s" % (h % 12 or 12, m, "AM" if h < 12 else "PM")
 
 
@@ -315,16 +318,33 @@ def split_sessions(bars):
     return days
 
 
-def full_sessions(days, before):
-    """Full sessions (all 78 bars) strictly before the plan's date, oldest first,
+CRYPTO_DAY_BARS = 288      # 24 hours of 5-minute bars in one UTC day
+CRYPTO_MIN_SESSIONS = 1    # the run needs at least one full UTC day before the entry day
+
+
+def split_sessions_crypto(bars):
+    """{date: {slot: bar}} for crypto bars, split at midnight UTC. A UTC day
+    holds 288 five-minute bars, slots 0 to 287."""
+    days = {}
+    for b in bars:
+        start = utc_of(b["t"])
+        slot = (start.hour * 60 + start.minute) // 5
+        days.setdefault(start.date().isoformat(), {})[slot] = {
+            "date": start.date().isoformat(), "slot": slot, "start": start.strftime("%H:%M"),
+            "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+    return days
+
+
+def full_sessions(days, before, session_bars=SESSION_BARS):
+    """Full sessions (all session_bars bars) strictly before the plan's date, oldest first,
     and the short ones that were left out (half days, gaps)."""
     full, short = [], []
     for d in sorted(days):
         if d >= before:
             continue
         s = days[d]
-        if len(s) == SESSION_BARS:
-            full.append((d, [s[i] for i in range(SESSION_BARS)]))
+        if len(s) == session_bars:
+            full.append((d, [s[i] for i in range(session_bars)]))
         else:
             short.append({"date": d, "bars": len(s)})
     return full, short
@@ -332,28 +352,43 @@ def full_sessions(days, before):
 
 # ---------------------------------------------------------------- the simulation (sim.py)
 
-def build_pool(sessions):
-    """pool[i] = every past session's bar i as (o, h, l, c) / bar i-1's close, in date order."""
-    pool = [[] for _ in range(SESSION_BARS)]
+def build_pool(sessions, session_bars=SESSION_BARS):
+    """pool[i] = every past session's bar i as (o, h, l, c) / bar i-1's close, in date order.
+    A bar whose previous close is $0 carries no ratio, so it is left out; a
+    slot left empty by that is a flat bar (1, 1, 1, 1), never a crash."""
+    pool = [[] for _ in range(session_bars)]
     for _, D in sessions:
-        for i in range(1, SESSION_BARS):
+        for i in range(1, session_bars):
             pc = D[i - 1]["c"]
+            if pc == 0:
+                continue
             pool[i].append((D[i]["o"] / pc, D[i]["h"] / pc, D[i]["l"] / pc, D[i]["c"] / pc))
-    return pool
+    return [slot if slot else [(1.0, 1.0, 1.0, 1.0)] for slot in pool]
+
+
+def _sig_round(p, digits=8):
+    """A price to significant digits: $0.000000004 stays $0.000000004
+    instead of rounding to $0.00000000 at 8 decimal places."""
+    return float(("%." + str(digits) + "g") % p)
 
 
 def pct(a, q):
     return a[min(len(a) - 1, int(q * len(a)))]
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy"):
-    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py."""
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy",
+             session_bars=SESSION_BARS, places=2, sig_digits=None):
+    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py.
+    sig_digits rounds prices to significant digits instead of decimal places:
+    crypto passes sig_digits=8, so a $0.000000004 close stays $0.000000004
+    in the sample paths and bands instead of rounding to $0.00000000."""
     long = side == "buy"
     risk = (entry - stop) if long else (stop - entry)
     r_target = round(((target - entry) if long else (entry - target)) / risk, 4)
+    rp = (lambda p: _sig_round(p, sig_digits)) if sig_digits else (lambda p: round(p, places))
 
     def slot(rng, i):
-        return i if window == 0 else min(SESSION_BARS - 1, max(1, i + rng.randint(-window, window)))
+        return i if window == 0 else min(session_bars - 1, max(1, i + rng.randint(-window, window)))
 
     rng = random.Random(seed)
     choice = rng.choice
@@ -379,7 +414,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                         outcome = "target"
             p = cl
             if keep:
-                path.append(round(p, 2))
+                path.append(rp(p))
         outcomes.append(outcome or "close")
         closes.append(p)
         if keep:
@@ -405,7 +440,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     bands = []
     for j in range(last - k + 1):
         col = sorted(pp[j] for pp in allp)
-        bands.append([round(pct(col, q), 2) for q in BAND_Q])
+        bands.append([rp(pct(col, q)) for q in BAND_Q])
     lo_, hi_ = pct(srt, 0.01), pct(srt, 0.99)
     W = (hi_ - lo_) / HIST_BINS
     bins = [0] * HIST_BINS
@@ -417,19 +452,20 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
         "replays": replays, "seed": seed, "window": window, "bars_left": last - k,
         "p_target": round(cnt["target"] / replays, 4), "p_stop": round(cnt["stop"] / replays, 4),
         "p_neither": round(cnt["close"] / replays, 4), "p_green": round(green / replays, 4),
-        "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
-        "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
+        "median_close": rp(pct(srt, 0.5)), "p5_close": rp(pct(srt, 0.05)),
+        "p95_close": rp(pct(srt, 0.95)), "avg_R": round(statistics.mean(Rs), 3),
         "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
-        "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
+        "hist": {"lo": rp(lo_), "hi": rp(hi_), "bins": bins},
     }
 
 
 # ---------------------------------------------------------------- stop rules and the history replay
 
-def cents_away(x, long):
-    """Round a stop to the cent, away from the entry: down for a buy, up for a sell."""
-    c = round(x * 100, 4)
-    return (math.floor(c) if long else math.ceil(c)) / 100.0
+def cents_away(x, long, places=2):
+    """Round a stop to the quantum, away from the entry: down for a buy, up for a sell."""
+    q = 10 ** places
+    c = round(x * q, 4)
+    return (math.floor(c) if long else math.ceil(c)) / q
 
 
 def opening_range(D, n):
@@ -438,21 +474,24 @@ def opening_range(D, n):
     return max(b["h"] for b in rows), min(b["l"] for b in rows)
 
 
-def rule_stop(rule, oh, ol, entry, long):
+def rule_stop(rule, oh, ol, entry, long, places=2):
     r = rule["stop_rule"]
     if r == "or_mid":
-        return cents_away((oh + ol) / 2, long)
+        return cents_away((oh + ol) / 2, long, places)
     if r in ("or_low", "or_high"):
-        return cents_away(ol if long else oh, long)
+        return cents_away(ol if long else oh, long, places)
     frac = rule["stop_pct"] / 100.0
-    return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
+    return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long, places)
 
 
-def history_replay(sessions, rule, last, side="buy"):
+def history_replay(sessions, rule, last, side="buy", open_min=OPEN_MIN, places=2, sig_digits=None):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
-    target, bar by bar, else the close at --until."""
+    target, bar by bar, else the close at --until. open_min is the session's open
+    in minutes after midnight (9:30 New York for stocks, 0:00 UTC for crypto).
+    sig_digits rounds prices to significant digits (crypto) instead of places."""
     long = side == "buy"
+    rp = (lambda p: _sig_round(p, sig_digits)) if sig_digits else (lambda p: round(p, places))
     n = rule["or_minutes"] // 5
     trades = []
     for d, D in sessions:
@@ -460,12 +499,12 @@ def history_replay(sessions, rule, last, side="buy"):
         kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)), None)
         if kk is None:
             continue
-        e = round(D[kk]["c"], 2)
-        s = rule_stop(rule, oh, ol, e, long)
+        e = rp(D[kk]["c"])
+        s = rule_stop(rule, oh, ol, e, long, places)
         risk = (e - s) if long else (s - e)
         if risk <= 0:
             continue
-        t = round(e + rule["target_r"] * risk, 2) if long else round(e - rule["target_r"] * risk, 2)
+        t = rp(e + rule["target_r"] * risk) if long else rp(e - rule["target_r"] * risk)
         oc = None
         for b in D[kk + 1:last + 1]:
             if (b["l"] <= s) if long else (b["h"] >= s):
@@ -477,7 +516,7 @@ def history_replay(sessions, rule, last, side="buy"):
         cl = D[last]["c"]
         R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
             ((cl - e) if long else (e - cl)) / risk
-        trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
+        trades.append({"date": d, "time": clock12(open_min + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
                        "outcome": oc or "close", "R": round(R, 2)})
     return {
         "sessions": len(sessions), "triggered": len(trades),
@@ -487,6 +526,79 @@ def history_replay(sessions, rule, last, side="buy"):
         "green": sum(1 for x in trades if x["R"] > 0),
         "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
         "rule": rule, "trades": trades,
+    }
+
+
+def close_clock(minutes):
+    """The close time of a bar: 24:00 is midnight the next day, not
+    12:00 AM on the entry day."""
+    if minutes >= 1440:
+        return "12:00 AM (next day)"
+    return clock12(minutes)
+
+
+def history_replay_crypto(pool_sessions, closed, atr_mult=2.0, target_r=2.0, sig_digits=8):
+    """The crypto-breakout rule on every past full UTC day: entry = the first
+    bar to close above the prior 24h high, stop = atr_mult x ATR(14) under
+    it, target = target_r x the risk above it; then stop first, then target,
+    bar by bar, else the close at the end of the day. A day with no close
+    above its 24h high never fires. Returns the same shape as
+    history_replay, with the crypto rule, so the report renders the same."""
+    rp = lambda p: _sig_round(p, sig_digits)
+    by_day = {}
+    for b in closed:
+        by_day.setdefault(utc_of(b["t"]).date().isoformat(), []).append(b)
+    # the prior 24h high for every closed bar, one sliding window pass
+    levels = {}
+    lo = 0
+    for i, b in enumerate(closed):
+        while closed[lo]["t"] <= b["t"] - 86400:
+            lo += 1
+        window = closed[lo:i]
+        levels[b["t"]] = max((x["h"] for x in window), default=None)
+    trades = []
+    for d, _ in pool_sessions:
+        day_bars = by_day.get(d) or []
+        kk = None
+        for j, b in enumerate(day_bars):
+            level = levels.get(b["t"])
+            if level and level > 0 and b["c"] > level:
+                kk = j
+                break
+        if kk is None:
+            continue
+        prior = [x for x in closed if x["t"] <= day_bars[kk]["t"]][-14:]
+        if len(prior) < 3:
+            continue
+        atr, atr_n = _atr_crypto(prior)
+        e = rp(day_bars[kk]["c"])
+        s = rp(e - atr_mult * atr)
+        risk = e - s
+        if risk <= 0:
+            continue
+        t = rp(e + target_r * risk)
+        oc = None
+        for b in day_bars[kk + 1:]:
+            if b["l"] <= s:
+                oc = "stop"
+                break
+            if b["h"] >= t:
+                oc = "target"
+                break
+        cl = day_bars[-1]["c"]
+        R = target_r if oc == "target" else -1.0 if oc == "stop" else (cl - e) / risk
+        trades.append({"date": d, "time": close_clock(5 * (kk + 1)), "entry": e, "stop": s, "target": t,
+                       "outcome": oc or "close", "R": round(R, 2)})
+    return {
+        "sessions": len(pool_sessions), "triggered": len(trades),
+        "target": sum(1 for x in trades if x["outcome"] == "target"),
+        "stop": sum(1 for x in trades if x["outcome"] == "stop"),
+        "close": sum(1 for x in trades if x["outcome"] == "close"),
+        "green": sum(1 for x in trades if x["R"] > 0),
+        "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
+        "rule": {"setup": "crypto-breakout", "stop_rule": "atr", "atr_mult": atr_mult,
+                 "target_r": target_r},
+        "trades": trades,
     }
 
 
@@ -753,6 +865,147 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     }
 
 
+def _atr_crypto(bars, n=14):
+    """ATR(14) on crypto bars, same Wilder math as trader-exit atr_of."""
+    trs, prev = [], None
+    for b in bars:
+        tr = b["h"] - b["l"]
+        if prev is not None:
+            tr = max(tr, abs(b["h"] - prev), abs(b["l"] - prev))
+        trs.append(tr)
+        prev = b["c"]
+    use = trs[-n:]
+    return sum(use) / len(use), len(use)
+
+
+def _crypto_module():
+    """The shared crypto data module, in trader-scanner next to this skill."""
+    here = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-scanner"))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import crypto
+    return crypto
+
+
+def _read_crypto_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError:
+        raise TMError("no offline file %s" % path)
+    except ValueError as e:
+        raise TMError("%s is not valid JSON: %s" % (path, e))
+
+
+def _crypto_symbol(doc, pair):
+    try:
+        sym = ((doc.get("meta") or {}).get("base") or {}).get("symbol") or ""
+    except AttributeError:
+        sym = ""
+    return sym.strip().upper() or pair
+
+
+def time_machine_crypto(bars, symbol, now_utc, replays=10000, seed=19, window=2, days=3,
+                        atr_mult=2.0, target_r=2.0, source="geckoterminal"):
+    """Crypto bars (oldest first) + a pool symbol -> the timemachine.json
+    document. The entry is the latest closed bar's close, the stop is
+    atr_mult x ATR(14) under it and the target is target_r x the risk above
+    it; the rest of that UTC day is replayed from the full UTC days before
+    it, and the history replay runs the same 24h-high breakout with an ATR
+    stop on those days. The entry need not have broken out: when the
+    latest close is under the 24h high the doc warns instead of refusing,
+    so the run replays a plan-ahead entry."""
+    if not 1 <= replays <= 1000000:
+        raise TMError("--replays must be between 1 and 1,000,000")
+    if not 0 <= window <= 10:
+        raise TMError("--window must be between 0 and 10 bars")
+    if days < 1:
+        raise TMError("--days must be at least 1")
+    for name, value in (("--atr-mult", atr_mult), ("--target-r", target_r)):
+        if not isinstance(value, (int, float)) or math.isnan(value) or math.isinf(value):
+            raise TMError("%s must be a finite number" % name)
+    if atr_mult <= 0:
+        raise TMError("--atr-mult must be above 0")
+    if target_r <= 0:
+        raise TMError("--target-r must be above 0")
+    if not bars:
+        raise TMError("no OHLCV bars for %s" % symbol)
+    now_ts = int((now_utc - EPOCH).total_seconds())
+    closed, dropped = [], {"no_price": 0, "off_grid": 0, "not_complete": 0, "outside_hours": 0}
+    for b in sorted(bars, key=lambda x: x["t"]):
+        if b["t"] % INTERVAL:
+            dropped["off_grid"] += 1
+            continue
+        if b["t"] + INTERVAL > now_ts:
+            dropped["not_complete"] += 1
+            continue
+        closed.append(b)
+    if len(closed) < 3:
+        raise TMError("only %d closed 5-minute bar(s) for %s; the time machine needs at least 3"
+                      % (len(closed), symbol))
+    entry_bar = closed[-1]
+    entry_day = utc_of(entry_bar["t"]).date().isoformat()
+    k = (entry_bar["t"] % 86400) // INTERVAL
+    entry = entry_bar["c"]
+    atr, atr_n = _atr_crypto(closed)
+    stop = entry - atr_mult * atr
+    if stop <= 0:
+        raise TMError("the ATR stop works out to %.8g: %.1f x ATR(%d) is wider than the entry %.8g"
+                      % (stop, atr_mult, atr_n, entry))
+    risk = entry - stop
+    target = entry + target_r * risk
+    prev = [b for b in closed[:-1] if b["t"] >= entry_bar["t"] - 86400]
+    prior_high = max(b["h"] for b in prev) if prev else None
+    sessions_all = split_sessions_crypto(closed)
+    full, short = full_sessions(sessions_all, entry_day, session_bars=CRYPTO_DAY_BARS)
+    if len(full) < CRYPTO_MIN_SESSIONS:
+        raise TMError("only %d full UTC day(s) of %s in the data; the time machine needs at least %d"
+                      % (len(full), symbol, CRYPTO_MIN_SESSIONS))
+    pool_sessions = full[-days:]
+    last = CRYPTO_DAY_BARS - 1
+    pool = build_pool(pool_sessions, session_bars=CRYPTO_DAY_BARS)
+    mc = simulate(pool, entry, stop, target, k, last, replays, seed, window, "buy",
+                  session_bars=CRYPTO_DAY_BARS, sig_digits=8)
+    mc = dict(mc, until="24:00", pool_sessions=len(pool_sessions), pool_from=pool_sessions[0][0],
+              pool_to=pool_sessions[-1][0],
+              band_times=[clock24(5 * (j + 1)) for j in range(k, last + 1)])
+    history = history_replay_crypto(pool_sessions, closed, atr_mult, target_r)
+    warn = []
+    if len(pool_sessions) < 5:
+        warn.append("only %d full UTC day(s) in the data; the replay pool is thin, treat the odds as rough"
+                    % len(pool_sessions))
+    if prior_high is not None and entry <= prior_high:
+        warn.append("no breakout: the latest close %.8g is under the 24h high %.8g, so this replays a "
+                    "plan-ahead entry, not a triggered breakout" % (entry, prior_high))
+    span_days = (closed[-1]["t"] - closed[0]["t"]) / 86400.0 + 5.0 / 1440.0
+    plan_out = {"symbol": symbol, "side": "buy", "date": entry_day, "setup": "crypto-breakout",
+                "entry": entry, "entry_time": close_clock(5 * (k + 1)), "entry_bar": k,
+                "stop": stop, "target": target, "risk_per_share": risk,
+                "target_r": target_r, "opening_range": {"minutes": 15},
+                "stop_rule": "atr", "interval": "5m", "flat_by": None,
+                "from": source, "asset": "crypto"}
+    last_bar = sessions_all[entry_day][k]
+    return {
+        "created_by": "trader-timemachine",
+        "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source,
+        "data": {"symbol": symbol, "interval": "5m",
+                 "range": "%d 5m bars (about %.1f days)" % (len(closed), span_days),
+                 "last_bar": "%s %s UTC" % (last_bar["date"], last_bar["start"]),
+                 "dropped": dropped, "short_sessions_left_out": short},
+        "plan": plan_out,
+        "mc": mc,
+        "history": history,
+        "verdict": verdict(mc),
+        "verdict_notes": verdict_notes(mc),
+        "warnings": warn,
+        "note": ("A simulation built from %s's own last %d full UTC day(s) (%d 5-minute bars cover about "
+                 "%.1f days). It is not a prediction: a pool this young has no earnings or halts, but a "
+                 "single whale can do what those days never did. Same seed, same numbers."
+                 % (symbol, len(pool_sessions), len(closed), span_days)),
+    }
+
+
 # ---------------------------------------------------------------- output
 
 def pc(x):
@@ -765,10 +1018,14 @@ def report(doc):
     until = clock12(int(m["until"][:2]) * 60 + int(m["until"][3:]))
     wd = WEEKDAYS[datetime.date.fromisoformat(p["date"]).weekday()]
     r = p["target_r"]
+
+    def pf(x):
+        return "%.8g" % x if p.get("asset") == "crypto" else "%.2f" % x
+
     lines = [
-        "%s %s, %s %s: entry %.2f at %s (bar %d), stop %.2f, target %.2f (%sR, risk %.2f a share)."
-        % (p["symbol"], p["side"], wd, p["date"], p["entry"], p["entry_time"], p["entry_bar"], p["stop"],
-           p["target"], ("%g" % r), p["risk_per_share"]),
+        "%s %s, %s %s: entry %s at %s (bar %d), stop %s, target %s (%sR, risk %s a share)."
+        % (p["symbol"], p["side"], wd, p["date"], pf(p["entry"]), p["entry_time"], p["entry_bar"], pf(p["stop"]),
+           pf(p["target"]), ("%g" % r), pf(p["risk_per_share"])),
         "%s replays of the rest of the session, %s to %s (%d five-minute bars), seed %d."
         % ("{:,}".format(m["replays"]), p["entry_time"], until, m["bars_left"], m["seed"]),
         "Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
@@ -780,24 +1037,32 @@ def report(doc):
         "  green          %-8s target first, or %s the entry at %s" % (pc(m["p_green"]),
                                                                        "above" if long else "below", until),
         "",
-        "  Price at %s: median %.2f, 90 %% of replays between %.2f and %.2f."
-        % (until, m["median_close"], m["p5_close"], m["p95_close"]),
-        "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
-        % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        "  Price at %s: median %s, 90 %% of replays between %s and %s."
+        % (until, pf(m["median_close"]), pf(m["p5_close"]), pf(m["p95_close"])),
+        "  Average R: %+.3f (R = the %s risk: %sR at the target, -1R at the stop)."
+        % (m["avg_R"], pf(p["risk_per_share"]), ("+%g" % m["r_at_target"]), ),
         "",
     ]
     if h.get("rule"):
         ru = h["rule"]
-        stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
-                      "or_high": "opening-range high"}.get(ru["stop_rule"],
-                                                           "%.2f %% from the entry" % ru.get("stop_pct", 0))
+        if ru.get("setup") == "crypto-breakout":
+            rule_words = ("24h-high breakout, stop at %g x ATR(14), %gR target"
+                          % (ru["atr_mult"], ru["target_r"]))
+            session_words = "real days"
+        else:
+            stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
+                          "or_high": "opening-range high"}.get(ru["stop_rule"],
+                                                               "%.2f %% from the entry" % ru.get("stop_pct", 0))
+            rule_words = ("%d-min opening range, stop at the %s, %gR target"
+                          % (ru["or_minutes"], stop_words, ru["target_r"]))
+            session_words = "real sessions"
         if h["triggered"]:
-            lines.append("History: the same rule (%d-min opening range, stop at the %s, %gR target) on each of "
-                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
-                         % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
+            lines.append("History: the same rule (%s) on each of those %d %s fired %d times: %d target, "
+                         "%d stop, %d neither. Average R %+.3f."
+                         % (rule_words, h["sessions"], session_words, h["triggered"],
                             h["target"], h["stop"], h["close"], h["avg_R"]))
         else:
-            lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
+            lines.append("History: the same rule never fired in those %d %s." % (h["sessions"], session_words))
     else:
         lines.append("History: " + h.get("note", "skipped."))
     lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
@@ -868,6 +1133,8 @@ def _write(path, doc):
 
 
 def compute(a):
+    if getattr(a, "asset", "stocks") == "crypto":
+        return compute_crypto(a)
     now = parse_now(a.now)
     plan = load_plan(a, now)
     if a.offline:
@@ -877,8 +1144,41 @@ def compute(a):
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
 
 
+def compute_crypto(a):
+    """run --asset crypto: a paged GeckoTerminal fetch (5-minute bars, about
+    (days + 1) x 288 bars, past the 1000-bar page cap) for one pool, replayed
+    over its UTC days."""
+    crypto = _crypto_module()
+    if a.chain not in crypto.DEX_TO_GT:
+        raise TMError("unknown chain %s: %s" % (a.chain, ", ".join(crypto.DEFAULT_CHAINS)))
+    if not a.pair:
+        raise TMError("--asset crypto needs --pair POOL_ADDRESS (the GeckoTerminal pool address)")
+    if a.days < 1:
+        raise TMError("--days must be at least 1")
+    try:
+        now = crypto.parse_now_utc(a.now) if a.now else crypto.now_utc()
+    except crypto.CryptoError as e:
+        raise TMError(str(e))
+    try:
+        if a.offline:
+            doc = _read_crypto_json(a.offline)
+            source = "offline"
+        else:
+            doc = crypto.fetch_ohlcv_paged(crypto.DEX_TO_GT[a.chain], a.pair, "minute", 5,
+                                           (a.days + 1) * 288)
+            source = "geckoterminal"
+    except crypto.CryptoError as e:
+        raise TMError(str(e))
+    bars = crypto.parse_ohlcv(doc)
+    return time_machine_crypto(bars, _crypto_symbol(doc, a.pair), now, a.replays, a.seed,
+                               a.window, a.days, source=source)
+
+
 def cmd_run(a):
     doc = compute(a)
+    if a.write == "DEFAULT":
+        a.write = ("trader/timemachine-crypto.json" if doc["plan"].get("asset") == "crypto"
+                   else "trader/timemachine.json")
     if a.write:
         _write(a.write, doc)
     if a.json:
@@ -893,6 +1193,9 @@ def cmd_run(a):
 
 
 def cmd_chart(a):
+    if a.from_file == "DEFAULT":
+        a.from_file = ("trader/timemachine-crypto.json" if a.asset == "crypto"
+                       else "trader/timemachine.json")
     if a.from_file:
         if not os.path.exists(a.from_file):
             raise TMError("no %s: run timemachine.py run --write first" % a.from_file)
@@ -934,13 +1237,23 @@ def main(argv=None):
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto (a pool, --chain and --pair)")
+    p.add_argument("--chain", default="solana", help="crypto only: DexScreener chain id")
+    p.add_argument("--pair", help="crypto only: the pool address")
+    p.add_argument("--days", type=int, default=5, help="crypto only: full UTC days to replay from (default 5)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--write", nargs="?", const="trader/timemachine.json", metavar="PATH",
-                   help="save the result (default trader/timemachine.json)")
+    p.add_argument("--write", nargs="?", const="DEFAULT", metavar="PATH",
+                   help="save the result (default trader/timemachine.json, trader/timemachine-crypto.json for --asset crypto)")
     p = sub.add_parser("chart", help="ASCII fan chart of the replays")
     common(p)
-    p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",
-                   help="draw a saved result instead of running again")
+    p.add_argument("--asset", choices=["stocks", "crypto"], default="stocks",
+                   help="stocks (default) or crypto (a pool, --chain and --pair)")
+    p.add_argument("--chain", default="solana", help="crypto only: DexScreener chain id")
+    p.add_argument("--pair", help="crypto only: the pool address")
+    p.add_argument("--days", type=int, default=5, help="crypto only: full UTC days to replay from (default 5)")
+    p.add_argument("--from", dest="from_file", nargs="?", const="DEFAULT", metavar="PATH",
+                   help="draw a saved result instead of running again (default trader/timemachine.json, trader/timemachine-crypto.json for --asset crypto)")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
